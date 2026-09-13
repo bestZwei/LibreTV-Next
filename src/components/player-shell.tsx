@@ -326,16 +326,6 @@ export function PlayerShell({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, adFilter]);
 
-  // 暴露实例给父组件做集数切换（换集时用 art.switch，避免整页重建）
-  useEffect(() => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (window as any).__libretv_player = artRef;
-    return () => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      delete (window as any).__libretv_player;
-    };
-  }, []);
-
   return (
     <div className="relative w-full h-full">
       <div ref={containerRef} className="w-full h-full" />

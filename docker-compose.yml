@@ -16,6 +16,8 @@ services:
       - PASSWORD=${PASSWORD:?请在 .env 中设置 PASSWORD}
       # 可选：会话/代理签名密钥（多实例部署建议显式设置：openssl rand -hex 32）
       # - PROXY_SECRET=your-secret
+      # 可选：Cookie Secure 策略覆盖（true=强制开启 / false=强制关闭；不设置时按请求协议自动推导，HTTP 部署无需配置）
+      # - COOKIE_SECURE=true
       # 可选：预置采集站（JSON 数组），用户端自动出现且默认勾选
       # - DEFAULT_SOURCES=[{"name":"示例源","url":"https://example.com/api.php/provide/vod"}]
       # 可选：预置直播源（M3U 订阅，JSON 数组），epg 为可选节目单地址

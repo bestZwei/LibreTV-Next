@@ -1,6 +1,7 @@
 'use client';
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { buildImageUrl, cn } from '@/lib/utils';
 import { useAppStore } from '@/lib/store';
 import {
@@ -20,12 +21,12 @@ import type { LiveChannel } from '@/lib/types';
  * - 搜索对分隔符归一化（cctv1 命中 CCTV-1），并匹配分组名；输入防抖后过滤；
  * - 可用性两档筛选（绿点=分片级验证 / 可播=含弱验证）；
  * - 支持批量测活：频道名前显示可达性状态点；
- * - 大列表渐进渲染 + 无限滚动（IntersectionObserver），「加载更多」兜底；
+ * - 虚拟列表（@tanstack/react-virtual）：仅渲染可视区内的频道行，数千频道下 DOM 恒定，
+ *   电视盒子 / 低端设备滑动不掉帧；行高动态测量（有无分组名两档）；
  * - 键盘：容器聚焦后 ↑↓ 移动光标、Enter 播放；
  * - 性能：本组件与 ChannelRow 均精确订阅 store，探测节流写回不会全列表重渲染。
  */
 
-const PAGE_SIZE = 300;
 const SEARCH_DEBOUNCE_MS = 200;
 
 export interface LiveChannelItem extends LiveChannel {
@@ -68,11 +69,9 @@ export function LiveChannelList({ channels, groups, currentUrl, onSelect, onFilt
   const debouncedKeyword = useDebouncedValue(keyword, SEARCH_DEBOUNCE_MS);
   const [sortMode, setSortMode] = useState<LiveSortMode>('default');
   const [aliveFilter, setAliveFilter] = useState<AliveFilter>('off');
-  const [limit, setLimit] = useState(PAGE_SIZE);
   /** 键盘光标（filtered 的下标），与"正在播放"高亮独立 */
   const [cursor, setCursor] = useState(-1);
   const listRef = useRef<HTMLDivElement>(null);
-  const sentinelRef = useRef<HTMLDivElement>(null);
   const { results: probeResults, progress: probeProgress, probe, clear: clearProbe, isProbing, hint: probeHint } = useLiveProbe();
 
   const favSet = useMemo(() => new Set(liveFavorites), [liveFavorites]);
@@ -128,41 +127,39 @@ export function LiveChannelList({ channels, groups, currentUrl, onSelect, onFilt
     return { ok, green };
   }, [matched, probeResults]);
 
-  // 切换筛选/排序/频道时：重置渐进渲染与键盘光标，并把当前播放频道滚入视区
+  // 键盘/锚定滚动需要按 URL 反查索引；filtered 随测活结果变化（排序含可用性），
+  // 用 ref 读取最新值，避免测活写回触发重新锚定打断用户滚动
+  const filteredRef = useRef(filtered);
+  filteredRef.current = filtered;
+
+  const virtualizer = useVirtualizer({
+    count: filtered.length,
+    getScrollElement: () => listRef.current,
+    // 行高两档：带分组名的双行 / 无分组名单行（含 4px 行距），measureElement 会修正估值
+    estimateSize: (i) => (filtered[i].group ? 51 : 47),
+    overscan: 10,
+    getItemKey: (i) => filtered[i].url,
+  });
+
+  // 切换筛选/排序/频道时：重置键盘光标，并把当前播放频道锚定到可视区（找不到则回顶部）
   useEffect(() => {
-    setLimit(PAGE_SIZE);
     setCursor(-1);
-    const root = listRef.current;
-    if (!root) return;
-    const activeRow = currentUrl
-      ? root.querySelector<HTMLElement>(`li[data-url="${CSS.escape(currentUrl)}"]`)
-      : null;
-    if (activeRow) activeRow.scrollIntoView({ block: 'nearest' });
-    else root.scrollTo({ top: 0 });
-  }, [view, group, sortMode, debouncedKeyword, aliveFilter, currentUrl]);
+    if (!currentUrl) {
+      virtualizer.scrollToOffset(0);
+      return;
+    }
+    const idx = filteredRef.current.findIndex((c) => c.url === currentUrl);
+    if (idx >= 0) virtualizer.scrollToIndex(idx, { align: 'auto' });
+    else virtualizer.scrollToOffset(0);
+  }, [view, group, sortMode, debouncedKeyword, aliveFilter, currentUrl, virtualizer]);
 
-  // 无限滚动：接近底部时自动续载
-  useEffect(() => {
-    const sentinel = sentinelRef.current;
-    const root = listRef.current;
-    if (!sentinel || !root || filtered.length <= limit) return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          setLimit((l) => Math.min(l + PAGE_SIZE, filtered.length));
-        }
-      },
-      { root, rootMargin: '240px' }
-    );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [filtered.length, limit]);
-
-  const scrollToChannelRow = useCallback((url: string) => {
-    listRef.current
-      ?.querySelector<HTMLElement>(`li[data-url="${CSS.escape(url)}"]`)
-      ?.scrollIntoView({ block: 'nearest' });
-  }, []);
+  const scrollToChannelRow = useCallback(
+    (url: string) => {
+      const idx = filteredRef.current.findIndex((c) => c.url === url);
+      if (idx >= 0) virtualizer.scrollToIndex(idx, { align: 'auto' });
+    },
+    [virtualizer]
+  );
 
   const onListKeyDown = (e: React.KeyboardEvent) => {
     if (filtered.length === 0) return;
@@ -172,9 +169,7 @@ export function LiveChannelList({ channels, groups, currentUrl, onSelect, onFilt
       const base = cursor === -1 ? (delta === 1 ? -1 : 0) : cursor;
       const next = Math.min(Math.max(base + delta, 0), filtered.length - 1);
       setCursor(next);
-      if (next >= limit) setLimit(next + PAGE_SIZE);
-      const target = filtered[next];
-      if (target) scrollToChannelRow(target.url);
+      virtualizer.scrollToIndex(next, { align: 'auto' });
       return;
     }
     if (e.key === 'Enter' && cursor >= 0 && cursor < filtered.length) {
@@ -188,8 +183,6 @@ export function LiveChannelList({ channels, groups, currentUrl, onSelect, onFilt
   const removeRecent = useCallback((url: string) => {
     useAppStore.getState().removeLiveRecent(url);
   }, []);
-
-  const visible = filtered.slice(0, limit);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -328,7 +321,7 @@ export function LiveChannelList({ channels, groups, currentUrl, onSelect, onFilt
         onKeyDown={onListKeyDown}
         className="flex-1 min-h-0 overflow-y-auto scrollbar-thin px-2 pb-2 focus:outline-none"
       >
-        {visible.length === 0 ? (
+        {filtered.length === 0 ? (
           <p className="text-center text-xs text-faint py-10">
             {view === 'fav'
               ? '暂无收藏频道，点击频道右侧星标即可收藏'
@@ -341,30 +334,39 @@ export function LiveChannelList({ channels, groups, currentUrl, onSelect, onFilt
                     : '没有匹配的频道'}
           </p>
         ) : (
-          <ul className="space-y-1">
-            {visible.map((c, i) => (
-              <ChannelRow
-                key={c.url}
-                channel={c}
-                active={c.url === currentUrl}
-                cursor={cursor === i}
-                isFav={favSet.has(c.url)}
-                probe={probeResults.get(c.url)}
-                logoUrl={buildImageUrl(c.logo, imageProxyMode, customImageProxy)}
-                onSelect={onSelect}
-                onRemoveRecent={view === 'recent' ? removeRecent : undefined}
-              />
+          <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+            {virtualizer.getVirtualItems().map((vi) => (
+              <div
+                key={vi.key}
+                data-index={vi.index}
+                ref={virtualizer.measureElement}
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  width: '100%',
+                  transform: `translateY(${vi.start}px)`,
+                  // 原 space-y-1 的 4px 行距；padding 计入 measureElement 量得的高度
+                  paddingBottom: 4,
+                }}
+              >
+                <ChannelRow
+                  channel={filtered[vi.index]}
+                  active={filtered[vi.index].url === currentUrl}
+                  cursor={cursor === vi.index}
+                  isFav={favSet.has(filtered[vi.index].url)}
+                  probe={probeResults.get(filtered[vi.index].url)}
+                  logoUrl={buildImageUrl(
+                    filtered[vi.index].logo,
+                    imageProxyMode,
+                    customImageProxy
+                  )}
+                  onSelect={onSelect}
+                  onRemoveRecent={view === 'recent' ? removeRecent : undefined}
+                />
+              </div>
             ))}
-          </ul>
-        )}
-        <div ref={sentinelRef} className="h-1" />
-        {filtered.length > limit && (
-          <button
-            className="btn-ghost w-full mt-2 !py-1.5 text-xs"
-            onClick={() => setLimit((l) => l + PAGE_SIZE)}
-          >
-            加载更多（剩余 {filtered.length - limit}）
-          </button>
+          </div>
         )}
       </div>
     </div>
@@ -407,13 +409,6 @@ const ChannelRow = memo(function ChannelRow({
   /** 仅最近视图传入：删除该条观看记录 */
   onRemoveRecent?: (url: string) => void;
 }) {
-  const ref = useRef<HTMLLIElement>(null);
-
-  // 当前播放项自动滚入视区
-  useEffect(() => {
-    if (active) ref.current?.scrollIntoView({ block: 'nearest' });
-  }, [active]);
-
   // H.265/HEVC：国内 IPTV 常见，测活通过但 Chromium 内核通常无法软解
   const isHevc = Boolean(probe?.codec && /hvc1|hev1|hevc/i.test(probe.codec));
   // 源限速：分片可达但吞吐不足，绿点却播不了的主因
@@ -443,7 +438,7 @@ const ChannelRow = memo(function ChannelRow({
     : undefined;
 
   return (
-    <li ref={ref} data-url={channel.url}>
+    <div data-url={channel.url}>
       <div
         role="button"
         tabIndex={-1}
@@ -547,6 +542,6 @@ const ChannelRow = memo(function ChannelRow({
           </svg>
         </button>
       </div>
-    </li>
+    </div>
   );
 });

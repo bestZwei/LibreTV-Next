@@ -1,6 +1,6 @@
 {
   "name": "libretv",
-  "version": "2.9.5",
+  "version": "2.9.6",
   "private": true,
   "description": "免费在线视频搜索与观看平台（Next.js 重构版）",
   "license": "AGPL-3.0-or-later",
@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.59.0",
+    "@tanstack/react-virtual": "^3.14.12",
     "artplayer": "^5.2.3",
     "dexie": "^4.0.8",
     "dexie-react-hooks": "^1.1.7",

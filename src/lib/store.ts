@@ -3,6 +3,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { SourceConfig, LiveSourceConfig, SourceSearchOutcome } from './types';
+import { clearLiveProbeResultsDb, loadLiveProbeResults, saveLiveProbeResults } from './db';
 
 /**
  * 全局设置（zustand + localStorage 持久化）。
@@ -428,16 +429,22 @@ export const useAppStore = create<AppState>()(
 
       setLiveProbeResults: (entries) => {
         const now = Date.now();
-        // 合并新结果并顺带清理过期条目，避免 localStorage 无限增长
+        // 合并新结果并顺带清理过期条目；内存态是唯一读取源，IndexedDB 仅作持久化
         const next: Record<string, LiveProbeEntry> = {};
         for (const [url, e] of Object.entries(get().liveProbeResults)) {
           if (now - e.timestamp < LIVE_PROBE_TTL_MS) next[url] = e;
         }
         for (const [url, e] of Object.entries(entries)) next[url] = e;
         set({ liveProbeResults: next });
+        // 只落库本批新增（按键覆盖），过期行由 hydrateLiveProbeResults 启动时清理；
+        // IndexedDB 不可用（隐私模式等）时静默放弃持久化，不影响本会话使用
+        saveLiveProbeResults(entries).catch(() => {});
       },
 
-      clearLiveProbeResults: () => set({ liveProbeResults: {} }),
+      clearLiveProbeResults: () => {
+        set({ liveProbeResults: {} });
+        clearLiveProbeResultsDb().catch(() => {});
+      },
 
       recordSourceHealth: (outcomes) => {
         if (outcomes.length === 0) return [];
@@ -518,7 +525,8 @@ export const useAppStore = create<AppState>()(
         }
         return state as AppState;
       },
-      // envSources 由服务端每次下发，不进 localStorage
+      // envSources 由服务端每次下发，不进 localStorage；
+      // liveProbeResults 体积大且写入频繁，持久化走 IndexedDB（db.ts liveProbe 表），不进 localStorage
       partialize: (s) => ({
         customAPIs: s.customAPIs,
         selectedKeys: s.selectedKeys,
@@ -529,7 +537,6 @@ export const useAppStore = create<AppState>()(
         liveSelectedUrls: s.liveSelectedUrls,
         liveFavorites: s.liveFavorites,
         liveRecent: s.liveRecent,
-        liveProbeResults: s.liveProbeResults,
         sourceHealth: s.sourceHealth,
         envSubsSeen: s.envSubsSeen,
         yellowFilter: s.yellowFilter,
@@ -547,6 +554,30 @@ export const useAppStore = create<AppState>()(
     }
   )
 );
+
+/**
+ * 从 IndexedDB 恢复测活缓存（Providers 挂载后、persist.rehydrate 之后调用）。
+ * - 必须晚于 rehydrate：旧版本把 liveProbeResults 存在 localStorage 的设置快照里，
+ *   rehydrate 会先把它读进内存，这里合并后一次性搬迁进 IndexedDB，快照随下次持久化自然瘦身；
+ * - 顺带清理表中过期行；IndexedDB 不可用时静默跳过（本会话仍可测活，只是不缓存）。
+ */
+export async function hydrateLiveProbeResults(): Promise<void> {
+  try {
+    const now = Date.now();
+    const stored = await loadLiveProbeResults();
+    const merged: Record<string, LiveProbeEntry> = { ...useAppStore.getState().liveProbeResults, ...stored };
+    const fresh: Record<string, LiveProbeEntry> = {};
+    for (const [url, e] of Object.entries(merged)) {
+      if (now - e.timestamp < LIVE_PROBE_TTL_MS) fresh[url] = e;
+    }
+    // 全量比对后整体覆写，同时覆盖「旧快照搬迁」与「表内过期行清理」两种情况
+    await clearLiveProbeResultsDb();
+    await saveLiveProbeResults(fresh);
+    useAppStore.setState({ liveProbeResults: fresh });
+  } catch {
+    // 隐私模式 / IndexedDB 被禁用：放弃持久化，不影响内存态
+  }
+}
 
 /** 获取指定 key 的源配置；找不到时支持从 URL 参数兜底构造 */
 export function resolveSource(

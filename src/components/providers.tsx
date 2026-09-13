@@ -5,7 +5,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { ToastProvider } from './toast';
 import { AuthProvider } from './auth';
 import { ThemeProvider } from './theme';
-import { useAppStore } from '@/lib/store';
+import { useAppStore, hydrateLiveProbeResults } from '@/lib/store';
 import { syncEnvSubscriptions } from '@/lib/subscription-sync';
 
 export function Providers({ children }: { children: ReactNode }) {
@@ -25,6 +25,9 @@ export function Providers({ children }: { children: ReactNode }) {
     // 避免 setEnvSources/setLiveEnvSources 的勾选合并发生在 rehydrate 之前被覆盖
     Promise.resolve(useAppStore.persist.rehydrate())
       .then(() => {
+        // 测活缓存从 IndexedDB 恢复（并顺带搬迁旧 localStorage 快照里的存量），
+        // 与下方 /api/status 拉取互不依赖，失败静默
+        void hydrateLiveProbeResults();
         // 拉取部署者通过 DEFAULT_SOURCES / DEFAULT_LIVE_SOURCES 预置的源（失败时静默忽略）
         return fetch('/api/status');
       })

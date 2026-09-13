@@ -1,11 +1,15 @@
 import Dexie, { type EntityTable } from 'dexie';
 import type { SourceConfig } from './types';
+// 仅类型引入：store.ts 运行时会引用本模块，反向只取类型不会形成运行时循环
+import type { LiveProbeEntry } from './store';
 
 /**
  * IndexedDB 持久化（替代旧版 localStorage 数据库）：
  * - 观看历史不再冗余存储全集 URL 列表（旧版长剧 × 50 条极易撑爆 5MB 配额），
  *   只存定位信息（sourceKey+vodId+index），进入播放页时按需重新拉详情，
  *   顺带免费获得「剧集更新同步」能力。
+ * - v2：直播测活缓存从 localStorage（随 zustand persist 整体重写）迁入独立表，
+ *   高频写入不再拖累设置快照的序列化。
  */
 
 export interface HistoryEntry {
@@ -39,12 +43,18 @@ export const db = new Dexie('libretv') as Dexie & {
   history: EntityTable<HistoryEntry, 'id'>;
   progress: EntityTable<ProgressEntry, 'key'>;
   searchHistory: EntityTable<SearchHistoryEntry, 'text'>;
+  liveProbe: EntityTable<LiveProbeEntry & { url: string }, 'url'>;
 };
 
 db.version(1).stores({
   history: 'id, timestamp',
   progress: 'key, updatedAt',
   searchHistory: 'text, timestamp',
+});
+
+// v2 仅新增表；Dexie 会自动继承低版本的表结构
+db.version(2).stores({
+  liveProbe: 'url',
 });
 
 export const MAX_HISTORY = 100;
@@ -130,6 +140,24 @@ export async function removeSearchHistory(text: string): Promise<void> {
 
 export async function clearSearchHistory(): Promise<void> {
   await db.searchHistory.clear();
+}
+
+// —— 直播测活缓存（TTL 过滤由调用方负责，本层只管存取） ——
+
+export async function loadLiveProbeResults(): Promise<Record<string, LiveProbeEntry>> {
+  const rows = await db.liveProbe.toArray();
+  const out: Record<string, LiveProbeEntry> = {};
+  for (const r of rows) out[r.url] = r;
+  return out;
+}
+
+export async function saveLiveProbeResults(entries: Record<string, LiveProbeEntry>): Promise<void> {
+  const rows = Object.entries(entries).map(([url, e]) => ({ ...e, url }));
+  if (rows.length > 0) await db.liveProbe.bulkPut(rows);
+}
+
+export async function clearLiveProbeResultsDb(): Promise<void> {
+  await db.liveProbe.clear();
 }
 
 // —— 配置导入导出（兼容旧版 LibreTV-Settings JSON 结构的导出格式） ——

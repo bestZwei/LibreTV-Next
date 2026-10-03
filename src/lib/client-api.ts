@@ -1,6 +1,6 @@
 'use client';
 
-import type { SearchResponse, SearchStreamEvent, SourceSearchOutcome, VideoDetail, DoubanResponse, BangumiCalendarResponse, AuthStatusResponse, SourceConfig, SearchResultItem, LivePlaylistResponse, LiveEpgResponse, SourceListPayload } from './types';
+import type { SearchResponse, SearchStreamEvent, SourceSearchOutcome, VideoDetail, DoubanResponse, BangumiCalendarResponse, AuthStatusResponse, SourceConfig, SearchResultItem, LivePlaylistResponse, LiveEpgResponse, SourceListPayload, AdRulesPayload } from './types';
 
 /**
  * 客户端 API 封装。401 时触发全局事件打开登录框，
@@ -190,6 +190,8 @@ export const api = {
     name?: string;
     sources: { name: string; url: string }[];
     liveSources: { name: string; url: string; epg?: string }[];
+    /** 广告标记规则（可选；服务端逐条校验后随源列表一起发布） */
+    adRules?: AdRulesPayload;
   }) =>
     request<{ url: string; provider: string; sources: number; liveSources: number }>('/api/publish', {
       method: 'POST',

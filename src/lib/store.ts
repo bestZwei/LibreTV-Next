@@ -16,6 +16,10 @@ export interface AppSettings {
   selectedKeys: string[];
   yellowFilter: boolean;
   adFilter: boolean;
+  /** 过滤发生时的「已过滤广告 N 秒」提示（关闭不影响过滤本身） */
+  adFilterNotice: boolean;
+  /** 启发式可疑区间的自动跳过（订阅来源与模糊确认同样只走跳过）；关闭后可疑区间照常播放 */
+  adSkipEnabled: boolean;
   doubanEnabled: boolean;
   /** 首页推荐数据源：豆瓣热门 / Bangumi 每日放送（免 key）/ 影视热榜（60s API） */
   recommendSource: 'douban' | 'bangumi' | 'hot-list';
@@ -32,6 +36,8 @@ export interface AppSettings {
 export interface SubscriptionSyncCounts {
   vod: number;
   live: number;
+  /** 广告标记规则条数（订阅含 adRules 时存在） */
+  adRules?: number;
 }
 
 /**
@@ -291,6 +297,8 @@ export const useAppStore = create<AppState>()(
       selectedKeys: [],
       yellowFilter: true,
       adFilter: true,
+      adFilterNotice: true,
+      adSkipEnabled: true,
       doubanEnabled: true,
       recommendSource: 'hot-list',
       recommendSourceTouched: false,
@@ -741,8 +749,9 @@ export const useAppStore = create<AppState>()(
       storage: createJSONStorage(createThrottledStorage),
       // v1：直播源新增归属字段、最近观看新增 sourceUrl。
       // v2：直播源归属改为多引用（fromSubscription 单值 → fromSubscriptions 数组）。
+      // v3：广告过滤新增提示/跳过开关（缺省补齐即可，无需结构转换）。
       // 此前未声明 version 的存量数据会被视为 v0 并走 migrate 补齐。
-      version: 2,
+      version: 3,
       migrate: (persisted, version) => {
         const state = { ...((persisted ?? {}) as Partial<AppState>) };
         if (!Array.isArray(state.liveRecent)) state.liveRecent = [];
@@ -783,6 +792,8 @@ export const useAppStore = create<AppState>()(
         envSubsSeen: s.envSubsSeen,
         yellowFilter: s.yellowFilter,
         adFilter: s.adFilter,
+        adFilterNotice: s.adFilterNotice,
+        adSkipEnabled: s.adSkipEnabled,
         doubanEnabled: s.doubanEnabled,
         recommendSource: s.recommendSource,
         recommendSourceTouched: s.recommendSourceTouched,

@@ -2,6 +2,7 @@
 
 import { api } from './client-api';
 import { normalizeSubscriptionUrl } from './source-list';
+import { importAdRules, refreshActiveFingerprints } from './ad-fingerprints';
 import { useAppStore } from './store';
 import { describeParseStats } from './tvbox-parser';
 import type { AuthStatusResponse, SubscriptionParseStats } from './types';
@@ -14,11 +15,15 @@ import type { AuthStatusResponse, SubscriptionParseStats } from './types';
  * 订阅内容由服务端自动识别格式（LibreTV-SourceList JSON 或 TVBOX 配置 JSON），
  * applySubscriptionSources / applySubscriptionLive 均按订阅前缀整体替换且保留
  * 用户勾选状态，同步失败时不调用即无副作用——旧数据自动保留。
+ * 订阅携带的 adRules（他人标记的广告指纹）合并进本地指纹库：
+ * 按 host:signature 去重、本地标记优先不覆盖，动作层为「仅跳过」。
  */
 export interface SubscriptionSyncResult {
   name?: string;
   vodCount: number;
   liveCount: number;
+  /** 本次合并的广告规则条数（无 adRules 时为 0） */
+  adRuleCount: number;
   /** 解析统计（识别格式、跳过与截断条目），用于导入结果提示 */
   stats?: SubscriptionParseStats;
 }
@@ -28,9 +33,20 @@ export async function syncSourceSubscription(rawUrl: string): Promise<Subscripti
   // 避免同一订阅地址因尾斜杠差异被存成两条订阅
   const url = normalizeSubscriptionUrl(rawUrl);
   try {
-    const { name, sources, liveSources, stats } = await api.fetchSourceList(url);
+    const { name, sources, liveSources, adRules, stats } = await api.fetchSourceList(url);
+    let adRuleCount = 0;
+    if (adRules?.entries.length) {
+      // 合并前先校验过（source-list 解析层），这里强制 subscription 来源入库（跳过级）
+      adRuleCount = await importAdRules(adRules.entries);
+      await refreshActiveFingerprints();
+    }
     if (sources.length === 0 && liveSources.length === 0) {
-      throw new Error('订阅内容为空');
+      if (adRuleCount === 0) throw new Error('订阅内容为空');
+      // 纯广告订阅：无源可应用，仅指纹入库
+      const store = useAppStore.getState();
+      store.addSubscription(url, name);
+      store.markSubscriptionSynced(url, name, { vod: 0, live: 0, adRules: adRuleCount });
+      return { name, vodCount: 0, liveCount: 0, adRuleCount, stats };
     }
     const store = useAppStore.getState();
     const vodCount = store.applySubscriptionSources(url, sources);
@@ -46,8 +62,8 @@ export async function syncSourceSubscription(rawUrl: string): Promise<Subscripti
       if (importedLiveUrls.has(s.url)) store.markLiveSynced(s.url, s.name, s.epg);
     }
     store.addSubscription(url, name);
-    store.markSubscriptionSynced(url, name, { vod: vodCount, live: liveCount });
-    return { name, vodCount, liveCount, stats };
+    store.markSubscriptionSynced(url, name, { vod: vodCount, live: liveCount, adRules: adRuleCount });
+    return { name, vodCount, liveCount, adRuleCount, stats };
   } catch (err) {
     // 记录失败状态供订阅列表展示（首次添加未成功时不产生条目）；已导入的旧数据保持不动
     const message = err instanceof Error ? err.message : '订阅同步失败';

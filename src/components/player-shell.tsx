@@ -11,6 +11,11 @@ import {
   getNextEpisodePrefetcher,
 } from '@/lib/video-prefetcher';
 import { loadCacheSettings } from '@/lib/video-cache';
+import { refreshActiveFingerprints, touchAdFingerprints, upsertAdFingerprints, getSubscriptionSignatures } from '@/lib/ad-fingerprints';
+import { resetEpisodeGroups, lookupGroupBySegmentUrl, getEpisodeGroup, getEpisodeGroupSegmentUrls } from '@/lib/ad-detect';
+import { matchAcrossEpisodes } from '@/lib/cross-episode';
+import { resolveSkipRanges, findSkipHit, type PendingSkipRange, type ResolvedSkipRange } from '@/lib/ad-skip';
+import { hostnameOf } from '@/lib/source-list';
 import { formatTime } from '@/lib/utils';
 
 /**
@@ -27,7 +32,13 @@ interface PlayerShellProps {
   url: string;
   title: string;
   adFilter: boolean;
+  /** 过滤发生时的提示开关（不影响过滤本身） */
+  adFilterNotice: boolean;
+  /** 启发式/订阅来源可疑区间的自动跳过开关（标记广告不受此开关限制） */
+  adSkipEnabled: boolean;
   autoplayNext: boolean;
+  /** 源 API 地址：广告指纹库按其 host 归档（跨集确认 / 命中计数） */
+  sourceUrl?: string;
   /** 剧集标识 `${source}:${vodId}:${episodeIndex}`（片段缓存按集淘汰的分组键） */
   episodeKey?: string;
   /** 下一集 m3u8 地址：当前集预取完成后预热下一集前 7 分钟 */
@@ -46,7 +57,10 @@ export function PlayerShell({
   url,
   title,
   adFilter,
+  adFilterNotice,
+  adSkipEnabled,
   autoplayNext,
+  sourceUrl,
   episodeKey,
   nextUrl,
   nextEpisodeKey,
@@ -68,11 +82,11 @@ export function PlayerShell({
 
   // 始终持有最新 props/回调，避免重建播放器
   const propsRef = useRef({
-    url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey,
+    url, title, adFilter, adFilterNotice, adSkipEnabled, autoplayNext, sourceUrl, episodeKey, nextUrl, nextEpisodeKey,
     getRestorePosition, onTimeUpdate, onEnded, onPause, onRequestSwitchSource,
   });
   propsRef.current = {
-    url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey,
+    url, title, adFilter, adFilterNotice, adSkipEnabled, autoplayNext, sourceUrl, episodeKey, nextUrl, nextEpisodeKey,
     getRestorePosition, onTimeUpdate, onEnded, onPause, onRequestSwitchSource,
   };
 
@@ -93,6 +107,76 @@ export function PlayerShell({
   const recoveryRef = useRef<PlaybackRecovery | null>(null);
   // 自然播完标记，卸载时不回写进度（避免覆盖「已看完」记录）
   const endedRef = useRef(false);
+  // 跨集指纹比对每集只跑一次（MANIFEST_PARSED 可能因代理回退再次触发）
+  const crossEpisodeDoneRef = useRef(false);
+  // —— 广告跳过层（启发式模糊确认 + 订阅来源，动作=seek 跳过可撤销，永不删除） ——
+  const pendingSkipsRef = useRef<PendingSkipRange[]>([]);
+  const skipRangesRef = useRef<ResolvedSkipRange[]>([]);
+  // 已跳过/被撤销的区间签名：防 seek 落点抖动重复触发；撤销后本集不再自动跳过该区间
+  const suppressedSkipsRef = useRef<Set<string>>(new Set());
+  const subSkipsBuiltRef = useRef(false);
+  const [skipNotice, setSkipNotice] = useState<{ seconds: number; from: number; signature: string } | null>(null);
+  const skipNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showSkipNotice = (seconds: number, from: number, signature: string) => {
+    setSkipNotice({ seconds, from, signature });
+    if (skipNoticeTimerRef.current) clearTimeout(skipNoticeTimerRef.current);
+    skipNoticeTimerRef.current = setTimeout(() => setSkipNotice(null), 8000);
+  };
+
+  const undoSkip = () => {
+    const notice = skipNotice;
+    setSkipNotice(null);
+    if (!notice) return;
+    suppressedSkipsRef.current.add(notice.signature);
+    const art = artRef.current;
+    if (art) art.currentTime = notice.from;
+  };
+
+  /** 收集全部档位的分片时间轴（同一内容多码率，时间轴一致） */
+  const getHlsFragments = (): Array<{ url: string; start: number; end: number }> => {
+    const hls = hlsRef.current;
+    if (!hls?.levels) return [];
+    const out: Array<{ url: string; start: number; end: number }> = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    for (const level of hls.levels as any[]) {
+      for (const f of level?.details?.fragments ?? []) {
+        if (typeof f.start !== 'number' || f.start < 0) continue;
+        out.push({ url: f.url, start: f.start, end: f.start + (f.duration || 0) });
+      }
+    }
+    return out;
+  };
+
+  /** 手动标记广告：定位当前分片所在组，签名入库（origin=user-mark，删除级） */
+  const markCurrentAd = async () => {
+    const art = artRef.current;
+    const hls = hlsRef.current;
+    if (!art || !hls) return;
+    const time = art.currentTime;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const level = (hls.levels as any[])?.[hls.currentLevel];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const frag = (level?.details?.fragments ?? [] as any[]).find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (f: any) => typeof f.start === 'number' && time >= f.start - 0.01 && time < f.start + (f.duration || 0)
+    );
+    const group = frag ? lookupGroupBySegmentUrl(frag.url) : undefined;
+    if (!group?.signature) {
+      showHint('未定位到当前分段，无法标记');
+      return;
+    }
+    const p = propsRef.current;
+    const host = p.sourceUrl ? hostnameOf(p.sourceUrl) : hostnameOf(currentMediaUrlRef.current);
+    try {
+      await upsertAdFingerprints([{ host, signature: group.signature, groupSeconds: group.seconds, origin: 'user-mark', note: p.title }]);
+      showHint('已标记为本源广告，重新加载生效');
+      // 重建 loader 使本集立即过滤；defer 到宏任务，避免在事件回调里销毁 hls
+      setTimeout(() => loadEpisode(currentMediaUrlRef.current || propsRef.current.url), 0);
+    } catch {
+      showHint('标记失败，请重试');
+    }
+  };
 
   const showHint = (text: string) => {
     setHint(text);
@@ -121,7 +205,15 @@ export function PlayerShell({
       abrEwmaDefaultEstimate: 500_000,
       appendErrorMaxRetry: 5,
       // 组合 loader：广告过滤（blockAd 随设置）+ 片段缓存命中（cacheEnabled）
-      loader: createHlsLoader(Hls, { blockAd: p.adFilter }) as unknown as HlsConfig['loader'],
+      loader: createHlsLoader(Hls, {
+        blockAd: p.adFilter,
+        // 指纹命中发生在 hls.js 内部，这里只做展示与计数；host 由 sourceUrl 补齐
+        onAdFiltered: (info) => {
+          if (p.adFilterNotice) showHint(`已过滤广告 ${Math.round(info.seconds)} 秒`);
+          const host = p.sourceUrl ? hostnameOf(p.sourceUrl) : undefined;
+          if (host) void touchAdFingerprints(host, info.signatures);
+        },
+      }) as unknown as HlsConfig['loader'],
     };
   };
 
@@ -153,7 +245,14 @@ export function PlayerShell({
    * 自动改走同源 cookie 鉴权的 /api/proxy 重试一次。
    * 注意：不销毁 ArtPlayer，只销毁并重建 hls，从而保留网页全屏等播放器状态。
    */
-  const setupHls = (video: HTMLVideoElement, mediaUrl: string, allowProxyFallback: boolean) => {
+  const setupHls = async (video: HTMLVideoElement, mediaUrl: string, allowProxyFallback: boolean) => {
+    // 指纹库预载先于 hls 构建：loader 的 onSuccess 是同步回调，查不了异步 DB。
+    // 放在这里（而非 loadEpisode）才能覆盖首播 customType、代理回退、错误重试全部路径
+    if (propsRef.current.adFilter) {
+      try {
+        await refreshActiveFingerprints();
+      } catch { /* 指纹库不可用不阻塞播放 */ }
+    }
     hlsRef.current?.destroy();
     currentMediaUrlRef.current = mediaUrl;
     const hls = new Hls(buildHlsConfig());
@@ -183,6 +282,27 @@ export function PlayerShell({
       }
       // 新集立即预取（否则要等 timeupdate 的 30s 节流，起播初期无缓存）
       ensurePrefetch(mediaUrl, prefetchAnchor);
+      // 跨集指纹比对（每集一次，需有下一集地址）：拉相邻集播放列表文本比对签名，
+      // 命中即入库。defer 到下一个宏任务——命中后要重建 hls，不能在 hls.js 自己的
+      // 事件回调里同步销毁它
+      const p = propsRef.current;
+      if (p.adFilter && p.nextUrl && !crossEpisodeDoneRef.current) {
+        crossEpisodeDoneRef.current = true;
+        void matchAcrossEpisodes(mediaUrl, p.nextUrl, p.sourceUrl).then((result) => {
+          // 模糊确认的短组进入跳过层（不删除）；精确命中已入库，重建 loader 生效
+          if (result.suspiciousGroups.length) {
+            const existing = new Set(pendingSkipsRef.current.map((s) => s.signature));
+            for (const g of result.suspiciousGroups) {
+              if (!existing.has(g.signature)) {
+                pendingSkipsRef.current.push({ signature: g.signature, seconds: g.seconds, urls: g.segmentLines, source: 'fuzzy' });
+              }
+            }
+          }
+          if (!result.matched) return;
+          showHint('已识别本集广告指纹，重新加载生效...');
+          setTimeout(() => loadEpisode(currentMediaUrlRef.current || mediaUrl), 0);
+        });
+      }
       video.play().catch(() => {});
     });
     // 播放链路恢复（FRAG_LOADED / MANIFEST_PARSED）：静默窗外清零连续失败计数
@@ -190,6 +310,28 @@ export function PlayerShell({
     // 分片真正进入 MSE buffer 才算媒体恢复：此时视频轨可渲染，错误态可解除
     hls.on(Hls.Events.FRAG_BUFFERED, () => {
       mediaHealthyRef.current = true;
+    });
+    // media 播放列表就绪：登记订阅来源的跳过区间（loader 的 onSuccess 此刻已建好组反查表）
+    hls.on(Hls.Events.LEVEL_LOADED, () => {
+      if (subSkipsBuiltRef.current) return;
+      subSkipsBuiltRef.current = true;
+      if (!propsRef.current.adSkipEnabled) return;
+      void getSubscriptionSignatures()
+        .then((sigs) => {
+          const existing = new Set(pendingSkipsRef.current.map((s) => s.signature));
+          for (const sig of sigs) {
+            if (existing.has(sig)) continue;
+            const group = getEpisodeGroup(sig);
+            if (!group) continue;
+            pendingSkipsRef.current.push({
+              signature: sig,
+              seconds: group.seconds,
+              urls: getEpisodeGroupSegmentUrls(sig),
+              source: 'subscription',
+            });
+          }
+        })
+        .catch(() => undefined);
     });
 
     hls.on(Hls.Events.ERROR, (_evt, data) => {
@@ -246,9 +388,18 @@ export function PlayerShell({
     videoErrorRetryUsedRef.current = false;
     restoredRef.current = false;
     lastPrefetchEnsureRef.current = 0;
+    crossEpisodeDoneRef.current = false;
+    // 跳过层状态按集重置
+    pendingSkipsRef.current = [];
+    skipRangesRef.current = [];
+    suppressedSkipsRef.current = new Set();
+    subSkipsBuiltRef.current = false;
+    setSkipNotice(null);
     recoveryRef.current = new PlaybackRecovery();
     // 换集时清掉上一集的预取窗口，避免带宽被旧集占用
     getVideoPrefetcher().stop();
+    // 分片 URL → 组反查表按集重建（跨档位累积登记，换集不清会残留上一集的地址）
+    resetEpisodeGroups();
     setError('');
     setShowPoster(true);
     const art = artRef.current;
@@ -340,6 +491,23 @@ export function PlayerShell({
         // 用 currentMediaUrlRef（代理回退后的实际地址）：否则预取的 key 与
         // loader 读取的 key 不一致，缓存永不命中且直连 fetch 白耗流量
         ensurePrefetch(currentMediaUrlRef.current, art.currentTime);
+      }
+      // —— 广告跳过层：pending 区间映射时间轴 + 命中自动 seek（可撤销） ——
+      if (propsRef.current.adSkipEnabled && (pendingSkipsRef.current.length || skipRangesRef.current.length)) {
+        if (pendingSkipsRef.current.length) {
+          const { resolved, remaining } = resolveSkipRanges(pendingSkipsRef.current, getHlsFragments());
+          pendingSkipsRef.current = remaining;
+          if (resolved.length) skipRangesRef.current.push(...resolved);
+        }
+        const hit = findSkipHit(art.currentTime, skipRangesRef.current);
+        if (hit && !suppressedSkipsRef.current.has(hit.signature)) {
+          suppressedSkipsRef.current.add(hit.signature);
+          // 片尾边界保护：区间贴着结尾时跳过无意义（可能正是片尾本身）
+          if (art.duration - art.currentTime > 1 && art.duration - hit.end > -1) {
+            art.currentTime = Math.min(hit.end + 0.05, Math.max(art.duration - 0.1, 0));
+            showSkipNotice(hit.seconds, hit.start, hit.signature);
+          }
+        }
       }
     });
     art.on('video:seeked', () => {
@@ -456,6 +624,7 @@ export function PlayerShell({
       document.removeEventListener('keydown', shortcuts);
       document.removeEventListener('visibilitychange', saveOnHide);
       if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
+      if (skipNoticeTimerRef.current) clearTimeout(skipNoticeTimerRef.current);
       el?.removeEventListener('touchstart', onTouchStart);
       el?.removeEventListener('touchend', onTouchEnd);
       el?.removeEventListener('touchcancel', onTouchEnd);
@@ -518,6 +687,23 @@ export function PlayerShell({
           {hint}
         </div>
       )}
+      {skipNotice && (
+        <div className="absolute top-14 left-1/2 -translate-x-1/2 bg-black/70 text-white text-sm px-3 py-1.5 rounded-full animate-fade-in flex items-center gap-2 whitespace-nowrap">
+          <span>已跳过疑似广告 {Math.round(skipNotice.seconds)} 秒</span>
+          <button className="text-primary hover:underline shrink-0" onClick={undoSkip}>
+            撤销
+          </button>
+        </div>
+      )}
+      {/* 手动标记广告：启发式没认出来的广告，用户标一次即全源永久过滤 */}
+      <div className="absolute bottom-16 left-3">
+        <button
+          className="text-[10px] text-white/80 bg-black/50 hover:bg-black/70 px-2 py-1 rounded pointer-events-auto transition-colors"
+          onClick={() => void markCurrentAd()}
+        >
+          标记广告
+        </button>
+      </div>
       {autoplayNext && !error && (
         <div className="absolute bottom-16 right-3 text-[10px] text-muted bg-black/50 px-2 py-0.5 rounded pointer-events-none">
           自动连播已开启

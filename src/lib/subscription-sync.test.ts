@@ -13,8 +13,15 @@ vi.mock('./client-api', () => ({
   api: { fetchSourceList: vi.fn() },
 }));
 
+// 广告指纹库走 Dexie/IndexedDB，node 环境下 mock（被测的是同步流的编排，不是库本身）
+vi.mock('./ad-fingerprints', () => ({
+  importAdRules: vi.fn(async (entries: unknown[]) => entries.length),
+  refreshActiveFingerprints: vi.fn(async () => 0),
+}));
+
 import { api } from './client-api';
-import { applyEnvPresets } from './subscription-sync';
+import { importAdRules } from './ad-fingerprints';
+import { applyEnvPresets, syncSourceSubscription } from './subscription-sync';
 import { useAppStore } from './store';
 import type { AuthStatusResponse, SourceListPayload } from './types';
 
@@ -221,5 +228,54 @@ describe('applyEnvPresets · DEFAULT_IMAGE_MODE', () => {
     await applyEnvPresets(status({ defaultImageMode: 'proxy' }));
     expect(useAppStore.getState().imageProxyMode).toBe('proxy');
     expect(useAppStore.getState().imageProxyModeTouched).toBe(false);
+  });
+});
+
+describe('syncSourceSubscription · adRules 合并', () => {
+  beforeEach(() => {
+    vi.mocked(importAdRules).mockClear();
+  });
+
+  it('订阅携带 adRules 时合并进指纹库并记录条数', async () => {
+    fetchSourceList.mockResolvedValueOnce({
+      name: '带广告标记的订阅',
+      sources: [{ name: '源', url: 'https://cj.example.com/api.php/provide/vod' }],
+      liveSources: [],
+      adRules: {
+        version: 1,
+        skipped: 1,
+        entries: [
+          { host: 'caiji.dyttzyapi.com', signature: '5.567|2.933|5.700', groupSeconds: 19.1 },
+        ],
+      },
+    } as SourceListPayload);
+
+    const result = await syncSourceSubscription('https://example.com/sub.json');
+    expect(result.adRuleCount).toBe(1);
+    expect(result.vodCount).toBe(1);
+    expect(importAdRules).toHaveBeenCalledWith([
+      { host: 'caiji.dyttzyapi.com', signature: '5.567|2.933|5.700', groupSeconds: 19.1 },
+    ]);
+    const sub = useAppStore.getState().subscriptions.find((s) => s.url === 'https://example.com/sub.json');
+    expect(sub?.lastCounts?.adRules).toBe(1);
+  });
+
+  it('纯广告订阅（无源只有规则）合法且入库', async () => {
+    fetchSourceList.mockResolvedValueOnce({
+      name: '纯广告订阅',
+      sources: [],
+      liveSources: [],
+      adRules: {
+        version: 1,
+        skipped: 0,
+        entries: [{ host: 'h.com', signature: '1.5|2.5', groupSeconds: 4 }],
+      },
+    } as SourceListPayload);
+
+    const result = await syncSourceSubscription('https://example.com/ads-only.json');
+    expect(result.adRuleCount).toBe(1);
+    expect(importAdRules).toHaveBeenCalled();
+    const sub = useAppStore.getState().subscriptions.find((s) => s.url === 'https://example.com/ads-only.json');
+    expect(sub).toBeTruthy();
   });
 });

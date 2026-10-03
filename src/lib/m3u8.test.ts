@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { parseM3u8Playlist } from './m3u8-parse';
 import { isProxiedUri, rewriteM3u8, stripAdGroups, stripLeadAdGroup } from './m3u8';
+import { PLAYLIST as EP1251_PLAYLIST } from './__fixtures__/ep1251';
 
 const BASE = 'https://cdn.example.com/live/index.m3u8';
 
@@ -283,11 +284,35 @@ describe('parseM3u8Playlist · 片头广告剔除', () => {
     expect(parsed.totalDuration).toBe(8);
   });
 
-  it('stripLeadAd=false 保留全部分片', async () => {
+  it('adFilter=false 保留全部分片', async () => {
+    const lines = ['#EXTM3U', '#EXT-X-DISCONTINUITY', '#EXTINF:5,', 'ad.ts', '#EXT-X-DISCONTINUITY', '#EXTINF:4,', 'movie.ts'];
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(lines.join('\n'), { status: 200 })));
+
+    const parsed = await parseM3u8Playlist('https://cdn.example.com/a.m3u8', 0, undefined, { adFilter: false });
+    expect(parsed.segments).toHaveLength(2);
+  });
+
+  it('旧选项名 stripLeadAd=false 仍被接受（兼容一个版本）', async () => {
     const lines = ['#EXTM3U', '#EXT-X-DISCONTINUITY', '#EXTINF:5,', 'ad.ts', '#EXT-X-DISCONTINUITY', '#EXTINF:4,', 'movie.ts'];
     vi.stubGlobal('fetch', vi.fn(async () => new Response(lines.join('\n'), { status: 200 })));
 
     const parsed = await parseM3u8Playlist('https://cdn.example.com/a.m3u8', 0, undefined, { stripLeadAd: false });
     expect(parsed.segments).toHaveLength(2);
+  });
+});
+
+describe('stripAdGroups · dytt 真实样本基线（__fixtures__）', () => {
+  // group 13 = 4 片/18.1s 正片，紧贴广告组；任何短组启发式都不得触碰
+  const GROUP_13_SEG = '2a5c2b9e567749ecbc2cee64a63eb77d.ts';
+  const GROUP_14_SEG = '1fcd08f60e5dc52818a1484ce77aba43.ts';
+  const GROUP_15_SEG = 'e2c9ad9b68af90b1c346e86c9b7356f8.ts';
+
+  it('基线（Phase 1 前）：对 ep1251 只删首分片前失去语义的 DISCONTINUITY，广告与正片原样保留', () => {
+    const out = stripAdGroups(EP1251_PLAYLIST);
+    expect(out).not.toBe(EP1251_PLAYLIST); // 恰好删掉 1 行
+    expect(EP1251_PLAYLIST.split('\n').length - out.split('\n').length).toBe(1);
+    expect(out).toContain(GROUP_13_SEG);
+    expect(out).toContain(GROUP_14_SEG); // 指纹过滤上线后由 ad-detect.test.ts 接管此断言
+    expect(out).toContain(GROUP_15_SEG);
   });
 });

@@ -198,6 +198,28 @@ export interface SourceListPayload {
   name?: string;
   sources: Omit<SourceConfig, 'key'>[];
   liveSources: Omit<LiveSourceConfig, 'key'>[];
+  /** 广告标记规则（可选；只有 adRules 的订阅即「纯广告订阅」） */
+  adRules?: AdRulesPayload;
   /** 解析统计（格式、跳过与截断），老数据可能缺失 */
   stats?: SubscriptionParseStats;
+}
+
+/** 单条广告标记（订阅 / 导出的线格式） */
+export interface AdRuleEntry {
+  /** 源 API 地址的 hostname */
+  host: string;
+  /** EXTINF 时长签名，如 "5.567|2.933|5.700" */
+  signature: string;
+  contentHash?: string;
+  groupSeconds: number;
+  addedAt?: number;
+  note?: string;
+}
+
+/** 订阅 payload 中的广告规则块 */
+export interface AdRulesPayload {
+  version: 1;
+  entries: AdRuleEntry[];
+  /** 校验失败的条目数（提示用） */
+  skipped: number;
 }

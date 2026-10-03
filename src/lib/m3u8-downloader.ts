@@ -1,5 +1,6 @@
 import { parseM3u8Playlist, type ParsedPlaylist } from './m3u8-parse';
 import { StreamingTransmuxer } from './mp4-transmuxer';
+import { useAppStore } from './store';
 
 /**
  * 整集离线下载：
@@ -150,7 +151,8 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      parsed = await parseM3u8Playlist(url, 0, undefined, { stripLeadAd: true });
+      // 下载产物不带广告，但过滤开关与播放侧共用同一设置（用户关闭后原样下载）
+      parsed = await parseM3u8Playlist(url, 0, undefined, { adFilter: useAppStore.getState().adFilter });
       lastErr = undefined;
       break;
     } catch (err) {

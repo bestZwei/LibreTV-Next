@@ -17,7 +17,7 @@ LibreTV Next.js 迁移版：免费在线视频聚合搜索与观看平台。基�
 
 - **聚合搜索**：多采集站服务端并行搜索
 - **跨源同名聚合**：同名影片合并为一张卡片，展开即可比较和选择各来源
-- **HLS 播放**：ArtPlayer + hls.js，广告分片过滤、自动连播、倍速、快捷键、移动端长按 3 倍速
+- **HLS 播放**：ArtPlayer + hls.js，广告指纹过滤（跨集比对确定性识别换名注入的广告）、自动连播、倍速、快捷键、移动端长按 3 倍速
 - **直播 / IPTV**：M3U 订阅解析，`/live` 页面按分组浏览、搜索频道并站内播放（HLS + HTTP-FLV），支持 XMLTV 节目单（EPG）与频道收藏；直播流经专用长连接代理（`/api/live/stream`）转发
 - **进度同步**：播放进度与观看历史存于本机 IndexedDB，精确到秒的续播
 - **换源测速**：跨源搜索同名资源并测速排序，一键切换保留集数位置
@@ -148,7 +148,18 @@ PASSWORD=your-password npm start   # 监听 8080
       "url": "https://example.com/list.m3u",
       "epg": "https://example.com/epg.xml.gz"
     }
-  ]
+  ],
+  "adRules": {
+    "version": 1,
+    "entries": [
+      {
+        "host": "caiji.dyttzyapi.com",
+        "signature": "5.567|2.933|5.700",
+        "groupSeconds": 19.1,
+        "note": "片中部 19s 广告段"
+      }
+    ]
+  }
 }
 ```
 
@@ -167,12 +178,45 @@ PASSWORD=your-password npm start   # 监听 8080
 | `liveSources[].name` | 项 | string | 否 | 源显示名；缺省时使用 URL 主机名 |
 | `liveSources[].url` | 项 | string | **是** | M3U 播放列表地址（http/https） |
 | `liveSources[].epg` | 项 | string | 否 | XMLTV 节目单地址（`xml` / `xml.gz`），用于 `/live` 页展示节目单；地址非法时只丢弃该字段、保留整条源 |
+| `adRules` | 顶层 | object | 否 | **广告标记规则**（可选）：订阅可携带分享的广告指纹，见下方「广告标记规则（adRules）」；只有 `adRules` 没有源的订阅即「纯广告订阅」，同样合法 |
 
 **兼容与限制**：
 
-- 只写 `sources` 的老订阅照常可用（纯点播），只写 `liveSources` 则是纯直播订阅；两者都缺时提示「订阅内容格式不正确」；裸数组 `[{ "name": "...", "url": "..." }]` 视为点播源；
+- 只写 `sources` 的老订阅照常可用（纯点播），只写 `liveSources` 则是纯直播订阅，只写 `adRules` 则是**纯广告订阅**（只导入广告标记，不下发任何源）；三者都缺时提示「订阅内容格式不正确」；裸数组 `[{ "name": "...", "url": "..." }]` 视为点播源；
 - 按 `url` 去重（先到先得）；非 http(s) 地址会被过滤；**点播源**另需为公网地址（内网/回环/保留地址会被静默过滤），**直播源**在部署者设置 `LIVE_ALLOW_PRIVATE=1` 时可使用内网自建源地址；
 - 订阅由**服务端**拉取（拉取前经过 SSRF 校验），因此订阅地址**无需配置 CORS**，Gist、对象存储、任意静态托管均可。
+
+### 广告标记规则（adRules）
+
+订阅可以携带广告标记，让订阅者直接获得发布者积累的广告指纹：
+
+```json
+{
+  "adRules": {
+    "version": 1,
+    "entries": [
+      {
+        "host": "caiji.dyttzyapi.com",
+        "signature": "5.567|2.933|5.700",
+        "groupSeconds": 19.1,
+        "addedAt": 1759459200000,
+        "note": "片中部 19s 广告段"
+      }
+    ]
+  }
+}
+```
+
+| 字段 | 位置 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- | --- |
+| `adRules.entries[].host` | 项 | string | **是** | 源 API 地址的 hostname（如 `caiji.dyttzyapi.com`），规则按源归档 |
+| `adRules.entries[].signature` | 项 | string | **是** | EXTINF 时长签名：广告段逐分片时长按序拼接（`#EXTINF` 数值原文，`|` 分隔）。2-64 个 token，每个 token 为 1-3 位整数 + 可选 3 位小数；**全等长签名是封装节奏会被拒绝**，单 token 签名（GOP 整数值有跨集巧合风险）同样拒绝 |
+| `adRules.entries[].groupSeconds` | 项 | number | 否 | 该段总时长（秒），展示用 |
+| `adRules.entries[].note` | 项 | string | 否 | 备注（≤100 字符） |
+
+**动作分层（误杀保护）**：订阅来源的规则**只触发自动跳过**（播放进入该段时 seek 到段尾，可撤销），不会直接从播放列表删除——订阅是他人的输入，误标时用户可感知、可恢复。自己手动标记与跨集自动确认的规则才是删除级。
+
+单订阅规则上限 2000 条，超出与非法条目计入 `skipped`；本地已有同 `host:signature` 的手动标记不被订阅覆盖。
 
 ### 兼容 TVBOX 配置
 

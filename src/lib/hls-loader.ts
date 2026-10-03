@@ -1,12 +1,13 @@
 import type HlsType from 'hls.js';
-import { stripAdGroups } from './m3u8';
+import { stripAdsDetailed, registerEpisodeGroups } from './ad-detect';
 import { buildSegmentCacheKey, readCachedSegment, touchMeta } from './video-cache';
 
 /**
  * hls.js loader 工厂：在同一个 loader 里组合「广告过滤」与「片段缓存命中」。
  *
- * - manifest / level：走基类网络加载；blockAd 开启时在 onSuccess 里剔除
- *   片头插入的广告段（整段移除，保留 DISCONTINUITY 时间轴标记）；
+ * - manifest / level：走基类网络加载；blockAd 开启时在 onSuccess 里剔除广告段
+ *   （stripAds = 基线规则 + 指纹库匹配，见 ad-detect.ts），并登记「分片 URL → 组」
+ *   反查表供手动标记广告使用；
  * - fragment：cache-first——本地缓存命中直接合成响应（不回源），未命中走基类。
  *   BYTERANGE 分片（原文件切片）不缓存、直接回源。
  *
@@ -16,10 +17,21 @@ import { buildSegmentCacheKey, readCachedSegment, touchMeta } from './video-cach
  * hls.js 对每次请求都会 new 一个 loader 实例，因此实例上的 destroyed 标记
  * 生命周期安全（abort/destroy 后不再回调，防孤儿 onSuccess）。
  */
+export interface AdFilteredInfo {
+  /** 被指纹命中的组数 */
+  groups: number;
+  /** 广告总时长（秒） */
+  seconds: number;
+  /** 命中的签名（调用方按源 host 累加命中计数） */
+  signatures: string[];
+}
+
 interface LoaderOptions {
   blockAd?: boolean;
   /** 缓存命中探针（设置面板展示命中率用），可缺省 */
   onProbe?: (hit: boolean) => void;
+  /** 指纹过滤发生时回调（loader 侧不感知 host，由调用方补齐） */
+  onAdFiltered?: (info: AdFilteredInfo) => void;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -29,7 +41,7 @@ export function createHlsLoader(
   HlsCtor: typeof HlsType,
   options: LoaderOptions = {}
 ): HlsLoaderCtor {
-  const { blockAd = false, onProbe } = options;
+  const { blockAd = false, onProbe, onAdFiltered } = options;
 
   return class CacheFirstHlsLoader extends (HlsCtor.DefaultConfig.loader as HlsLoaderCtor) {
     private destroyed = false;
@@ -45,14 +57,29 @@ export function createHlsLoader(
 
         // —— 播放列表：网络加载 + 可选广告过滤 ——
         if (isPlaylist) {
-           
+
           if (blockAd) {
-             
+
             const onSuccess = callbacks.onSuccess;
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             callbacks.onSuccess = function (response: any, stats: any, ctx: any, networkDetails: any) {
               if (response.data && typeof response.data === 'string') {
-                response.data = stripAdGroups(response.data);
+                const { content, fingerprintRemoved } = stripAdsDetailed(response.data);
+                response.data = content;
+                // 登记「分片 URL → 组」反查表：key 归一化方式与片段缓存一致，
+                // 播放器侧手动标记广告时用同一构造器反查（buildSegmentCacheKey）。
+                // 注意不在这里 reset：master + 多档位 level 依次加载，累积登记互不冲突，
+                // 换集时由播放器负责 resetEpisodeGroups
+                if (content.includes('#EXTINF')) {
+                  registerEpisodeGroups(content, ctx?.url);
+                }
+                if (fingerprintRemoved.groups > 0) {
+                  onAdFiltered?.({
+                    groups: fingerprintRemoved.groups,
+                    seconds: fingerprintRemoved.seconds,
+                    signatures: fingerprintRemoved.signatures,
+                  });
+                }
               }
               onSuccess(response, stats, ctx, networkDetails);
             };
@@ -84,7 +111,7 @@ export function createHlsLoader(
             return;
           }
           onProbe?.(false);
-           
+
           const onSuccess = callbacks.onSuccess;
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           callbacks.onSuccess = (response: any, stats: any, ctx: any, networkDetails: any) => {

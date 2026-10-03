@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { guardRequest } from '@/lib/api-guard';
-import { MAX_LIVE_SOURCES, MAX_VOD_SOURCES } from '@/lib/source-list';
+import { MAX_AD_RULES, MAX_LIVE_SOURCES, MAX_VOD_SOURCES, parseAdRulesPayload } from '@/lib/source-list';
 import { MAX_PUBLISH_BYTES, publishSourceList } from '@/lib/source-list-publish';
 
 export const runtime = 'nodejs';
@@ -24,7 +24,12 @@ interface LiveOut {
  * 本接口的语义是「发布源列表」，不是通用上传通道：白名单式取字段 + 条数上限，
  * 避免它被当作任意内容的中转（服务端会向固定第三方域名 POST，这一点必须守住）。
  */
-function normalizePayload(raw: unknown): { name?: string; sources: VodOut[]; liveSources: LiveOut[] } | null {
+function normalizePayload(raw: unknown): {
+  name?: string;
+  sources: VodOut[];
+  liveSources: LiveOut[];
+  adRules?: { version: 1; entries: ReturnType<typeof parseAdRulesPayload>['entries'] };
+} | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const record = raw as Record<string, unknown>;
 
@@ -51,8 +56,15 @@ function normalizePayload(raw: unknown): { name?: string; sources: VodOut[]; liv
     })
     .filter((s) => s.url);
 
-  if (sources.length === 0 && liveSources.length === 0) return null;
-  return { name: text(record.name, 64) || undefined, sources, liveSources };
+  // 广告规则：白名单字段 + 逐条校验 + 条数上限（与解析层同一套约束）
+  const adRules = record.adRules ? parseAdRulesPayload(record.adRules) : undefined;
+  const adRulesOut =
+    adRules && adRules.entries.length > 0
+      ? { version: 1 as const, entries: adRules.entries.slice(0, MAX_AD_RULES) }
+      : undefined;
+
+  if (sources.length === 0 && liveSources.length === 0 && !adRulesOut) return null;
+  return { name: text(record.name, 64) || undefined, sources, liveSources, ...(adRulesOut ? { adRules: adRulesOut } : {}) };
 }
 
 /** 把当前源列表发布到第三方粘贴板，返回可直接填入订阅框的 URL */
@@ -80,13 +92,14 @@ export async function POST(req: Request) {
       exportedAt: Date.now(),
       sources: normalized.sources,
       liveSources: normalized.liveSources,
+      ...(normalized.adRules ? { adRules: normalized.adRules } : {}),
     },
     null,
     2
   );
 
   if (Buffer.byteLength(payload, 'utf8') > MAX_PUBLISH_BYTES) {
-    return NextResponse.json({ error: '源列表体积超出公开粘贴板的限制，无法发布' }, { status: 413 });
+    return NextResponse.json({ error: '内容体积超出公开粘贴板的限制，无法发布' }, { status: 413 });
   }
 
   try {

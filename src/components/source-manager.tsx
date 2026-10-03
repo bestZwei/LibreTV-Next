@@ -29,6 +29,7 @@ import { copyToClipboard } from '@/lib/clipboard';
 import { useAuth } from './auth';
 import { api } from '@/lib/client-api';
 import { syncSourceSubscription } from '@/lib/subscription-sync';
+import { AdFingerprintsPanel } from './ad-filter-panel';
 import { describeParseStats } from '@/lib/tvbox-parser';
 
 /**
@@ -563,10 +564,22 @@ function PlaybackPanel() {
       <SectionTitle title="播放与过滤" />
       <div className="space-y-3">
         <ToggleRow
-          label="广告切片过滤"
-          description="剔除播放列表中的广告分片段落（按分片 URL 特征、片头插入与长片间超短中插识别，不动 DISCONTINUITY 时间轴）"
+          label="广告指纹过滤"
+          description="剔除播放列表中的广告段落：URL 特征 / 时长中插 / 片头启发式之外，新增跨集指纹比对（同一支广告换名注入可确定性识别，正片与 OP/ED 不受影响）"
           checked={store.adFilter}
           onChange={(v) => store.updateSettings({ adFilter: v })}
+        />
+        <ToggleRow
+          label="过滤提示"
+          description="发生广告过滤时在播放器顶部显示「已过滤广告 N 秒」"
+          checked={store.adFilterNotice}
+          onChange={(v) => store.updateSettings({ adFilterNotice: v })}
+        />
+        <ToggleRow
+          label="可疑区间自动跳过"
+          description="跨集模糊确认的可疑片段与订阅来源标记只做自动跳过（可撤销），不直接删除；关闭后照常播放"
+          checked={store.adSkipEnabled}
+          onChange={(v) => store.updateSettings({ adSkipEnabled: v })}
         />
         <ToggleRow
           label="自动连播"
@@ -575,6 +588,7 @@ function PlaybackPanel() {
           onChange={(v) => store.updateSettings({ autoplayNext: v })}
         />
       </div>
+      <AdFingerprintsPanel />
       <VideoCachePanel />
     </section>
   );

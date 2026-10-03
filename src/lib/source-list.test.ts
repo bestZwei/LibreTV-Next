@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_LIVE_SOURCES, MAX_VOD_SOURCES, normalizeSubscriptionUrl, parseSourceListPayload } from './source-list';
+import { MAX_AD_RULES, MAX_LIVE_SOURCES, MAX_VOD_SOURCES, normalizeSubscriptionUrl, parseSourceListPayload } from './source-list';
 
 const vod = (url: string, extra: Record<string, unknown> = {}) => ({ name: `源 ${url}`, url, ...extra });
 const live = (url: string, extra: Record<string, unknown> = {}) => ({ name: `频道 ${url}`, url, ...extra });
@@ -143,5 +143,59 @@ describe('normalizeSubscriptionUrl', () => {
     expect(normalizeSubscriptionUrl('  https://a.example.com/list.json/  ')).toBe('https://a.example.com/list.json');
     expect(normalizeSubscriptionUrl('https://a.example.com/list.json///')).toBe('https://a.example.com/list.json');
     expect(normalizeSubscriptionUrl('https://a.example.com/list.json')).toBe('https://a.example.com/list.json');
+  });
+});
+
+describe('adRules（广告规则订阅）', () => {
+  const OK_ENTRY = { host: 'caiji.dyttzyapi.com', signature: '5.567|2.933|5.700', groupSeconds: 19.1 };
+
+  it('完整订阅携带 adRules：合法条目解析，非法条目计入 skipped', () => {
+    const payload = parseSourceListPayload({
+      name: '订阅',
+      sources: [{ url: 'https://cj.example.com/api.php/provide/vod' }],
+      adRules: {
+        version: 1,
+        entries: [
+          OK_ENTRY,
+          { host: 'h.com', signature: '4.171|4.171|4.171|4.171|4.171' }, // 等长签名拒绝
+          { host: 'h.com', signature: 'abc' }, // 非法 token
+          { host: '', signature: '1.5|2.5' }, // 坏 host
+          OK_ENTRY, // 重复
+        ],
+      },
+    });
+    expect(payload.adRules?.entries).toEqual([OK_ENTRY]);
+    expect(payload.adRules?.skipped).toBe(4);
+  });
+
+  it('纯广告订阅（只有 adRules）合法', () => {
+    const payload = parseSourceListPayload({
+      name: '纯广告',
+      adRules: { version: 1, entries: [OK_ENTRY] },
+    });
+    expect(payload.sources).toHaveLength(0);
+    expect(payload.liveSources).toHaveLength(0);
+    expect(payload.adRules?.entries).toHaveLength(1);
+  });
+
+  it('adRules 全部非法且无源：仍然抛错', () => {
+    expect(() =>
+      parseSourceListPayload({ adRules: { version: 1, entries: [{ host: '', signature: 'x' }] } })
+    ).toThrow();
+  });
+
+  it('超过条数上限截断', () => {
+    const entries = Array.from({ length: 2100 }, (_, i) => ({
+      host: `h${i}.com`,
+      signature: `${(i % 900) + 1}.5|${(i % 900) + 1}.6`,
+    }));
+    const payload = parseSourceListPayload({ adRules: { version: 1, entries } });
+    expect(payload.adRules?.entries).toHaveLength(MAX_AD_RULES);
+    expect(payload.adRules?.skipped).toBe(100);
+  });
+
+  it('老格式订阅（无 adRules 字段）解析结果不带 adRules 键', () => {
+    const payload = parseSourceListPayload({ sources: [{ url: 'https://cj.example.com/api.php/provide/vod' }] });
+    expect(payload.adRules).toBeUndefined();
   });
 });

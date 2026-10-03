@@ -1,4 +1,5 @@
-import { makeAbsolute, stripAdGroups, documentBaseURI } from './m3u8';
+import { makeAbsolute, documentBaseURI } from './m3u8';
+import { stripAds } from './ad-detect';
 
 /**
  * m3u8 播放列表解析（预取器与离线下载共用）。
@@ -98,8 +99,54 @@ function parseAesConf(line: string): AesConf | undefined {
 }
 
 export interface ParseOptions {
-  /** 剔除广告段（URL 特征的中插段 + 片头无特征插入段）；缺省 true */
+  /** 广告过滤总开关：URL 特征 / 时长中插 / 片头启发式 / 指纹库匹配全量生效；缺省 true。
+   *  旧名 stripLeadAd（实际控制的从来不只是片头）仍被接受，仅作兼容 */
+  adFilter?: boolean;
+  /** @deprecated 改用 adFilter */
   stripLeadAd?: boolean;
+}
+
+/**
+ * 拉取播放列表原文（master 递归解析到 media 层），不做任何广告过滤。
+ * 供跨集签名比对使用：比对必须基于与入库时一致的过滤后文本，
+ * 但比对本身需要相邻集的「原始分组结构」，不能走带副作用的解析管线。
+ */
+export async function fetchMediaPlaylistText(
+  url: string,
+  depth = 0
+): Promise<{ text: string; baseUrl: string }> {
+  if (depth > MAX_DEPTH) throw new Error(`m3u8 嵌套超过 ${MAX_DEPTH} 层`);
+  const base = makeAbsolute(url, documentBaseURI());
+  const res = await fetch(base, { headers: { Accept: '*/*' } });
+  if (!res.ok) throw new Error(`m3u8 拉取失败：HTTP ${res.status}`);
+  const text = await res.text();
+  if (text.includes('#EXT-X-STREAM-INF')) {
+    const variants: ParsedVariant[] = [];
+    let pending: { bandwidth: number; height?: number } | undefined;
+    for (const raw of text.split('\n')) {
+      const line = raw.trim();
+      if (line.startsWith('#EXT-X-STREAM-INF')) {
+        const bandwidth = parseInt(line.match(/BANDWIDTH=(\d+)/)?.[1] || '0', 10);
+        const resolution = line.match(/RESOLUTION=(\d+)x(\d+)/);
+        pending = { bandwidth, height: resolution ? parseInt(resolution[2], 10) : undefined };
+        continue;
+      }
+      if (!line || line.startsWith('#')) continue;
+      if (pending) {
+        variants.push({
+          url: makeAbsolute(line, base),
+          bandwidth: pending.bandwidth,
+          height: pending.height ?? inferHeightFromBitrate(pending.bandwidth),
+        });
+        pending = undefined;
+      }
+    }
+    if (!variants.length) throw new Error('master m3u8 未解析到可用档位');
+    // 与播放侧无关，取最高带宽档即可——同源各档位的广告组结构一致
+    const chosen = pickVariant(variants);
+    return fetchMediaPlaylistText(chosen.url, depth + 1);
+  }
+  return { text, baseUrl: base };
 }
 
 /** 解析播放列表：master 递归选档，media 输出分片清单。fetch 失败 / 超限直接抛错由调用方降级 */
@@ -116,8 +163,9 @@ export async function parseM3u8Playlist(
   const base = makeAbsolute(url, documentBaseURI());
   const res = await fetch(base, { headers: { Accept: '*/*' } });
   if (!res.ok) throw new Error(`m3u8 拉取失败：HTTP ${res.status}`);
-  // 剔除片头广告段要在统计时长/分片之前做，下载产物才不会带上广告
-  const text = opts?.stripLeadAd === false ? await res.text() : stripAdGroups(await res.text());
+  // 广告剔除要在统计时长/分片之前做，下载产物才不会带上广告（含指纹库匹配，见 ad-detect.ts）
+  const adFilterEnabled = opts?.adFilter ?? opts?.stripLeadAd ?? true;
+  const text = adFilterEnabled ? stripAds(await res.text()) : await res.text();
 
   // —— master：收集变体，选档后递归 ——
   if (text.includes('#EXT-X-STREAM-INF')) {

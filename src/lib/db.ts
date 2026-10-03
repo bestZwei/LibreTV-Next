@@ -70,6 +70,28 @@ export interface DownloadTaskEntry {
   updatedAt: number;
 }
 
+/** 广告指纹来源。动作分层依据：确定性来源（user-mark / cross-episode）可删除播放列表组；
+ *  不可完全信任的来源（subscription / heuristic）只允许触发跳过，永不删除 */
+export type AdFingerprintOrigin = 'user-mark' | 'cross-episode' | 'subscription' | 'heuristic';
+
+export interface AdFingerprintEntry {
+  /** 主键：`${host}:${signature}` */
+  id: string;
+  /** 源 API 地址的 hostname（订阅与播放页的 sourceUrl 对齐） */
+  host: string;
+  /** EXTINF 时长签名，如 "5.567|2.933|5.700"（逐分片时长按序拼接） */
+  signature: string;
+  /** 可选的第二指纹：组内首分片内容前缀哈希（源站改切片方式时兜底） */
+  contentHash?: string;
+  /** 入库时组的总时长（秒），展示与排查用 */
+  groupSeconds: number;
+  origin: AdFingerprintOrigin;
+  hits: number;
+  firstSeen: number;
+  lastHit: number;
+  note?: string;
+}
+
 export const db = new Dexie('libretv') as Dexie & {
   history: EntityTable<HistoryEntry, 'id'>;
   progress: EntityTable<ProgressEntry, 'key'>;
@@ -77,6 +99,7 @@ export const db = new Dexie('libretv') as Dexie & {
   liveProbe: EntityTable<LiveProbeEntry & { url: string }, 'url'>;
   segmentMeta: EntityTable<SegmentMetaEntry, 'key'>;
   downloads: EntityTable<DownloadTaskEntry, 'id'>;
+  adFingerprints: EntityTable<AdFingerprintEntry, 'id'>;
 };
 
 db.version(1).stores({
@@ -94,6 +117,11 @@ db.version(2).stores({
 db.version(3).stores({
   segmentMeta: 'key, episodeKey, lastAccess',
   downloads: 'id, createdAt',
+});
+
+// v4：广告指纹库（EXTINF 时长签名，按源 host 归档；详见 ad-fingerprints.ts）
+db.version(4).stores({
+  adFingerprints: 'id, host, signature, origin, lastHit',
 });
 
 export const MAX_HISTORY = 100;

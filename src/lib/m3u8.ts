@@ -215,7 +215,7 @@ function stripMarkedAdGroups(m3u8Content: string): string {
 const INTERSTITIAL_MAX_SECONDS = 30;
 const INTERSTITIAL_NEIGHBOR_MIN_SECONDS = 120;
 
-interface AdGroupScan {
+export interface AdGroupScan {
   /** 组内容行区间 [start, end)，不含组前的 DISCONTINUITY 行 */
   start: number;
   end: number;
@@ -225,8 +225,9 @@ interface AdGroupScan {
   count: number;
 }
 
-/** 按 DISCONTINUITY 把播放列表切成组：组 k（k≥1）前的边界行是 discIdx[k-1] */
-function scanGroups(lines: string[], isDisc: (l: string) => boolean, isSegment: (l: string) => boolean): AdGroupScan[] {
+/** 按 DISCONTINUITY 把播放列表切成组：组 k（k≥1）前的边界行是 discIdx[k-1]。
+ *  导出供 ad-detect.ts 的指纹签名 / 可疑簇检测复用（isDisc/isSegment 由调用方注入） */
+export function scanGroups(lines: string[], isDisc: (l: string) => boolean, isSegment: (l: string) => boolean): AdGroupScan[] {
   const discIdx: number[] = [];
   for (let i = 0; i < lines.length; i++) if (isDisc(lines[i])) discIdx.push(i);
 
@@ -284,8 +285,9 @@ function stripInterstitialAdGroups(m3u8Content: string): string {
   return lines.filter((_, idx) => !drop[idx]).join('\n');
 }
 
-/** 清除首个分片之前的 DISCONTINUITY：其前没有媒体内容，标记无语义（hls.js 的 cc 从 0 开始） */
-function stripLeadingDisc(content: string): string {
+/** 清除首个分片之前的 DISCONTINUITY：其前没有媒体内容，标记无语义（hls.js 的 cc 从 0 开始）。
+ *  导出供 ad-detect.ts 的指纹剔除收尾复用（删组可能让新的首组失去前文） */
+export function stripLeadingDisc(content: string): string {
   const lines = content.split('\n');
   const firstSeg = lines.findIndex((l) => {
     const t = l.trim();

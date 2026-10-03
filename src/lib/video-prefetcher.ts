@@ -1,4 +1,5 @@
 import { parseM3u8Playlist, type ParsedPlaylist } from './m3u8-parse';
+import { refreshActiveFingerprints } from './ad-fingerprints';
 import {
   buildSegmentCacheKey,
   loadCacheSettings,
@@ -213,6 +214,10 @@ export class VideoPrefetcher {
 
     let parsed: ParsedPlaylist;
     try {
+      // 解析前兜底刷新指纹活跃表（parseM3u8Playlist 内的 stripAds 是同步查表）。
+      // 不 await：播放路径上 setupHls 已先行刷新过，这里只是兜底（如独立预取场景），
+      // 且 run() 必须同步发出 m3u8 fetch（ensure 幂等的时序前提）
+      void refreshActiveFingerprints().catch(() => undefined);
       parsed = await parseM3u8Playlist(options.m3u8Url);
     } catch (err) {
       if (generation !== this.generation) return;

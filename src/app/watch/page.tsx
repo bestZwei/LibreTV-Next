@@ -240,7 +240,10 @@ function WatchContent() {
                   url={currentUrl}
                   title={videoTitle}
                   adFilter={store.adFilter}
+                  adFilterNotice={store.adFilterNotice}
+                  adSkipEnabled={store.adSkipEnabled}
                   autoplayNext={store.autoplayNext}
+                  sourceUrl={source?.url}
                   episodeKey={`${sourceKey}:${vodId}:${currentIndex}`}
                   nextUrl={currentIndex + 1 < episodes.length ? episodes[currentIndex + 1] : undefined}
                   nextEpisodeKey={currentIndex + 1 < episodes.length ? `${sourceKey}:${vodId}:${currentIndex + 1}` : undefined}

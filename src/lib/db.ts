@@ -85,6 +85,8 @@ export interface AdMarkEntry {
   end: number;
   /** 分段内分片数 */
   segCount: number;
+  /** 分段内分片的绝对地址（时间轴剔除用：loader 按文件名匹配并整组移除） */
+  urls?: string[];
   /** 入库指纹数量（学习完成前为 0） */
   fingerprintCount: number;
   createdAt: number;

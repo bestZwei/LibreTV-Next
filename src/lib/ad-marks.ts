@@ -106,6 +106,15 @@ export async function listAdMarks(): Promise<AdMarkEntry[]> {
   }
 }
 
+/** 某剧集的全部标记（时间轴剔除注册用） */
+export async function getMarksForEpisode(episodeKey: string): Promise<AdMarkEntry[]> {
+  try {
+    return await db.adMarks.where('episodeKey').equals(episodeKey).toArray();
+  } catch {
+    return [];
+  }
+}
+
 /** 删除标记；连带删除其指纹（除非同一指纹被其他标记共享），并顺带清理孤儿指纹 */
 export async function removeAdMark(markId: string): Promise<void> {
   const hashes = await fingerprintsOfMark(markId);

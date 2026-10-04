@@ -8,9 +8,10 @@ import { PlaybackRecovery, describeHlsError } from '@/lib/playback-recovery';
 import { createHlsLoader } from '@/lib/hls-loader';
 import {
   findGroupAt, mergeRanges, isAdjacentRange,
-  addAdMark, learnMarkFingerprints, removeAdMark, type FragLike,
+  addAdMark, getMarksForEpisode, learnMarkFingerprints, removeAdMark, type FragLike,
 } from '@/lib/ad-marks';
 import { ensureFingerprintsLoaded } from '@/lib/ad-fingerprints';
+import { registerStripForPlaylist, unregisterStripForPlaylist, fragUrlsOf } from '@/lib/ad-strip';
 import { useToast } from './toast';
 import {
   getVideoPrefetcher,
@@ -100,10 +101,14 @@ export function PlayerShell({
   // 自然播完标记，卸载时不回写进度（避免覆盖「已看完」记录）
   const endedRef = useRef(false);
   // —— 用户标记广告（第 4 层） ——
-  // 当前集的跳过区间（用户标记 + 指纹命中合并），rAF 守卫据此 seek 越过
+  // 当前集的跳过区间（用户标记 + 指纹命中合并），守卫据此 seek 越过
   const adRangesRef = useRef<{ start: number; end: number }[]>([]);
   // 最近一次标记（10s 内再次点击 = 扩展到相邻分组）
   const lastMarkRef = useRef<{ range: { start: number; end: number }; markId: string; at: number } | null>(null);
+  // 上一帧播放位置（跳过守卫的「自然越过」判定；手动 seek 落入区间不弹）
+  const lastPosRef = useRef<number | null>(null);
+  // 重建链路后的恢复位置（标记时间轴剔除/撤销时校正进度）
+  const pendingResumeRef = useRef<number | null>(null);
   const { toast: showToast } = useToast();
 
   const showHint = (text: string) => {
@@ -150,7 +155,7 @@ export function PlayerShell({
     const last = lastMarkRef.current;
     const extending = !!(last && Date.now() - last.at < 10_000 && isAdjacentRange(last.range, target));
 
-    // 当集立即生效
+    // 当集立即生效（若随后重建链路会被清空，改为时间轴剔除生效）
     adRangesRef.current = mergeRanges([...adRangesRef.current, { start: target.start, end: target.end }]);
     if (t >= target.start && t < target.end) art.currentTime = target.end;
 
@@ -158,6 +163,21 @@ export function PlayerShell({
     const epIndex = Number(epKey.split(':').pop());
     const episodeLabel = Number.isFinite(epIndex) ? `第 ${epIndex + 1} 集` : '';
     const scope = target.whole ? '当前分段' : '当前分片（该源无分段边界）';
+
+    // —— 时间轴剔除：注册分片文件名并重建播放链路，广告从进度条上消失 ——
+    // 有分组边界（可整组移除）时执行；降级形态（单分片）仍走跳过式。
+    let resumeAt: number | null = null;
+    if (target.whole) {
+      const mediaUrl = currentMediaUrlRef.current;
+      registerStripForPlaylist(mediaUrl, fragUrlsOf(target.frags));
+      // 位置校正：旧时间轴上位于广告之后的播放位置，新时间轴前移一个广告时长
+      resumeAt = t >= target.end ? t - (target.end - target.start) : Math.max(t, 0);
+      pendingResumeRef.current = resumeAt;
+      setupHls(art.video, mediaUrl, true);
+      // 剔除后时间轴收短，区间坐标已作废
+      adRangesRef.current = [];
+      lastMarkRef.current = null;
+    }
 
     void (async () => {
       try {
@@ -168,13 +188,17 @@ export function PlayerShell({
           start: target.start,
           end: target.end,
           segCount: target.frags.length,
+          urls: fragUrlsOf(target.frags),
           fingerprintCount: 0,
         });
-        lastMarkRef.current = { range: { start: target.start, end: target.end }, markId: mark.id, at: Date.now() };
+        if (!target.whole) lastMarkRef.current = { range: { start: target.start, end: target.end }, markId: mark.id, at: Date.now() };
         const learned = await learnMarkFingerprints(mark.id, target.frags);
         showToast(
           `已标记广告 ${formatTime(target.start)}–${formatTime(target.end)}（${scope}${extending ? '，已扩展' : ''}），` +
-            `本片源今后自动跳过${learned ? `，已学习 ${learned} 个分片指纹` : ''}`,
+            (target.whole
+              ? `已从播放进度条中移除${resumeAt !== null ? '，从原位置继续播放' : ''}`
+              : '本片源今后自动跳过') +
+            (learned ? `，已学习 ${learned} 个分片指纹` : ''),
           'success',
           {
             action: {
@@ -185,6 +209,12 @@ export function PlayerShell({
                   (r) => !(Math.abs(r.start - target.start) < 0.5 && Math.abs(r.end - target.end) < 0.5)
                 );
                 if (lastMarkRef.current?.markId === mark.id) lastMarkRef.current = null;
+                // 撤销时间轴剔除：重新拉取未剔除的播放列表并回到原位置
+                if (target.whole) {
+                  unregisterStripForPlaylist(currentMediaUrlRef.current, fragUrlsOf(target.frags));
+                  pendingResumeRef.current = target.start; // 剔除区间在新时间轴的起点
+                  setupHls(art.video, currentMediaUrlRef.current, true);
+                }
               },
             },
           }
@@ -253,14 +283,40 @@ export function PlayerShell({
     currentMediaUrlRef.current = mediaUrl;
     // 跳过区间按媒体时间轴计，换源（换集/重试/代理回退）后作废
     adRangesRef.current = [];
+    lastPosRef.current = null;
     const hls = new Hls(buildHlsConfig());
     hlsRef.current = hls;
 
-    hls.loadSource(mediaUrl);
     hls.attachMedia(video);
+
+    // 先注册该集已标记分组的剔除指令（Dexie 读取，毫秒级），再拉取播放
+    // 列表——保证标记的分组在首次交付时就被移除；注册失败降级为指纹跳过
+    void (async () => {
+      try {
+        const epKey = propsRef.current.episodeKey;
+        if (epKey) {
+          const marks = await getMarksForEpisode(epKey);
+          const urls = marks.flatMap((m) => m.urls || []);
+          if (urls.length) registerStripForPlaylist(mediaUrl, urls);
+        }
+      } catch { /* 注册失败不影响播放 */ }
+      hls.loadSource(mediaUrl);
+    })();
 
     hls.on(Hls.Events.MANIFEST_PARSED, async () => {
       recoveryRef.current?.markHealthy();
+      // 重建链路的恢复位置（标记时间轴剔除/撤销后的进度校正），优先于
+      // 保存进度恢复
+      if (pendingResumeRef.current != null) {
+        const at = pendingResumeRef.current;
+        pendingResumeRef.current = null;
+        restoredRef.current = true;
+        video.currentTime = at;
+        // 预取锚点：恢复目标
+        ensurePrefetch(mediaUrl, at);
+        video.play().catch(() => {});
+        return;
+      }
       // 预取锚点：恢复进度时直接取恢复目标。赋值后 video.currentTime 未必立刻反映
       // （Safari 系），而 ensure 是以「锚点未变」为前提复用 parsing 中的运行的——
       // 这里读到旧值会把窗口建在片头，且白等一次纠错重建。
@@ -430,19 +486,25 @@ export function PlayerShell({
 
     // 兜底跳过守卫（双通道）：rAF 在页面可见时逐帧检查（反应 ≤1 帧）；
     // video:timeupdate 在后台标签页仍以 ~250ms 触发，兜底 rAF 停转的场景。
-    // 两者共用同一区间列表与判定：播放位置进入广告区间即 seek 到区间末尾。
+    // 跳过仅在「播放自然越过区间起点」时触发——手动 seek 落入区间视为
+    // 用户主动回看，不弹回（否则 ← 回退会被守卫卡死）。
     const skipAdAt = () => {
-      const ranges = adRangesRef.current;
-      if (!ranges.length) return;
       const cur = artRef.current;
       const t = cur?.currentTime;
       if (typeof t !== 'number' || cur?.paused) return;
+      const ranges = adRangesRef.current;
+      const prev = lastPosRef.current;
       for (const r of ranges) {
         if (t >= r.start && t < r.end - 0.25) {
+          // prev 为 null（刚起播/换源）视为自然越过；上一位置已在区间内或
+          // 区间之后 → 说明是 seek 进来的，放行
+          if (prev !== null && prev >= r.start - 0.25) return;
           cur.currentTime = r.end;
+          lastPosRef.current = r.end;
           return;
         }
       }
+      lastPosRef.current = t;
     };
     const adGuard = () => {
       skipAdAt();
@@ -450,6 +512,10 @@ export function PlayerShell({
     };
     requestAnimationFrame(adGuard);
     art.on('video:timeupdate', () => skipAdAt());
+    art.on('video:seeked', () => {
+      // seek 后以落点为基准重置「上一位置」：落在区间内 = 用户意图，不弹
+      lastPosRef.current = artRef.current?.currentTime ?? null;
+    });
 
     art.on('video:loadedmetadata', () => {
       // ArtPlayer 运行时支持 title 选项（类型定义未覆盖），用于界面标题展示

@@ -1,5 +1,6 @@
 import type HlsType from 'hls.js';
 import { stripAdGroups } from './m3u8';
+import { getStripForPlaylist, stripSegments } from './ad-strip';
 import { getKnownFingerprints, sha256PrefixHex, FINGERPRINT_PREFIX_BYTES } from './ad-fingerprints';
 import { buildSegmentCacheKey, readCachedSegment, touchMeta } from './video-cache';
 
@@ -74,17 +75,35 @@ export function createHlsLoader(
 
         // —— 播放列表：网络加载 + 可选广告过滤 ——
         if (isPlaylist) {
-           
+
+          // 用户标记的时间轴剔除（user 信任级，不受 blockAd 开关限制）：
+          // 该播放列表有已标记分组的注册时，交付前整组移除——广告从时间轴
+          // 上消失，进度条/seek/回退行为与普通视频一致
+          const stripNames = getStripForPlaylist(context.url);
+
           if (blockAd) {
-             
+
             const onSuccess = callbacks.onSuccess;
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             callbacks.onSuccess = function (response: any, stats: any, ctx: any, networkDetails: any) {
               if (response.data && typeof response.data === 'string') {
-                response.data = stripAdGroups(response.data);
+                let data = stripAdGroups(response.data);
+                if (stripNames.size) data = stripSegments(data, stripNames).text;
+                response.data = data;
               }
               onSuccess(response, stats, ctx, networkDetails);
             };
+          } else {
+            if (stripNames.size) {
+              const onSuccess = callbacks.onSuccess;
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              callbacks.onSuccess = function (response: any, stats: any, ctx: any, networkDetails: any) {
+                if (response.data && typeof response.data === 'string') {
+                  response.data = stripSegments(response.data, stripNames).text;
+                }
+                onSuccess(response, stats, ctx, networkDetails);
+              };
+            }
           }
           load(context, config, callbacks);
           return;

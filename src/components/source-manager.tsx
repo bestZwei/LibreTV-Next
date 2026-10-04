@@ -24,6 +24,8 @@ import type { SourceConfig } from '@/lib/types';
 import { useToast } from './toast';
 import { formatRelativeTime, hostnameOf, validateSourceUrl, cn } from '@/lib/utils';
 import { exportConfig, importConfig } from '@/lib/db';
+import { listAdMarks, removeAdMark } from '@/lib/ad-marks';
+import type { AdMarkEntry } from '@/lib/db';
 import { PERSIST_KEY } from '@/lib/persist-storage';
 import { copyToClipboard } from '@/lib/clipboard';
 import { useAuth } from './auth';
@@ -576,6 +578,7 @@ function PlaybackPanel() {
         />
       </div>
       <VideoCachePanel />
+      <AdMarksPanel />
     </section>
   );
 }
@@ -629,6 +632,65 @@ function VideoCachePanel() {
           清理缓存
         </button>
       </div>
+    </div>
+  );
+}
+
+/** 用户标记的广告分段管理：列表 + 单条删除（连带其指纹） */
+function AdMarksPanel() {
+  const { toast } = useToast();
+  const [marks, setMarks] = useState<AdMarkEntry[]>([]);
+
+  const refresh = useCallback(() => {
+    void listAdMarks().then(setMarks);
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const fmt = (s: number) => {
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+  };
+
+  return (
+    <div className="space-y-3 pt-3 mt-3 border-t border-line">
+      <div className="flex items-center justify-between text-xs text-faint">
+        <span>播放时点「标记广告」可让广告分段在本片源所有集数中自动跳过（含指纹跨集命中）</span>
+        <span>共 {marks.length} 条</span>
+      </div>
+      {marks.length > 0 && (
+        <ul className="space-y-2">
+          {marks.map((m) => (
+            <li key={m.id} className="flex items-center justify-between gap-2 text-xs bg-chip rounded-md px-3 py-2">
+              <div className="min-w-0">
+                <div className="text-content truncate">
+                  {m.title}
+                  {m.episodeLabel ? ` · ${m.episodeLabel}` : ''} · {fmt(m.start)}–{fmt(m.end)}
+                </div>
+                <div className="text-faint">
+                  {m.segCount} 个分片 · 指纹 {m.fingerprintCount} 条 · {formatRelativeTime(m.createdAt)}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="rounded-md p-2 text-muted transition-colors hover:bg-hover hover:text-danger shrink-0"
+                aria-label="删除标记"
+                title="删除标记（连带其指纹）"
+                onClick={async () => {
+                  await removeAdMark(m.id);
+                  refresh();
+                  toast('已删除标记及其指纹', 'success');
+                }}
+              >
+                <Icon name="trash" className="w-4 h-4" />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

@@ -70,6 +70,34 @@ export interface DownloadTaskEntry {
   updatedAt: number;
 }
 
+/** 用户标记的广告分段（一个 DISCONTINUITY 分组或单个分片，见 ad-marks.ts） */
+export interface AdMarkEntry {
+  /** 主键：`${episodeKey}_${Math.round(start * 10)}` */
+  id: string;
+  /** 影片标题（管理列表展示用） */
+  title: string;
+  /** 所属剧集：`${sourceKey}:${vodId}:${episodeIndex}` */
+  episodeKey: string;
+  /** 集名（如「第1251集」，展示用） */
+  episodeLabel: string;
+  /** 起止秒数（媒体时间轴） */
+  start: number;
+  end: number;
+  /** 分段内分片数 */
+  segCount: number;
+  /** 入库指纹数量（学习完成前为 0） */
+  fingerprintCount: number;
+  createdAt: number;
+}
+
+/** 用户标记学到的分片指纹（内容前 64KB 的 SHA-256，user 信任级） */
+export interface AdFingerprintEntry {
+  hash: string;
+  origin: 'user';
+  markId: string;
+  createdAt: number;
+}
+
 export const db = new Dexie('libretv') as Dexie & {
   history: EntityTable<HistoryEntry, 'id'>;
   progress: EntityTable<ProgressEntry, 'key'>;
@@ -77,6 +105,8 @@ export const db = new Dexie('libretv') as Dexie & {
   liveProbe: EntityTable<LiveProbeEntry & { url: string }, 'url'>;
   segmentMeta: EntityTable<SegmentMetaEntry, 'key'>;
   downloads: EntityTable<DownloadTaskEntry, 'id'>;
+  adMarks: EntityTable<AdMarkEntry, 'id'>;
+  adFingerprints: EntityTable<AdFingerprintEntry, 'hash'>;
 };
 
 db.version(1).stores({
@@ -94,6 +124,12 @@ db.version(2).stores({
 db.version(3).stores({
   segmentMeta: 'key, episodeKey, lastAccess',
   downloads: 'id, createdAt',
+});
+
+// v4：用户标记的广告分段与学到的分片指纹（跨集/跨片跳过的依据）
+db.version(4).stores({
+  adMarks: 'id, episodeKey, createdAt',
+  adFingerprints: 'hash, markId',
 });
 
 export const MAX_HISTORY = 100;
@@ -219,6 +255,12 @@ export async function exportConfig(): Promise<string> {
   };
   if (settings) data[PERSIST_KEY] = settings;
 
+  // 用户标记与指纹一并迁移（人工 ground truth，最有价值的过滤数据）
+  const adMarks = await db.adMarks.toArray();
+  const adFingerprints = await db.adFingerprints.toArray();
+  if (adMarks.length) data['adMarks'] = JSON.stringify(adMarks);
+  if (adFingerprints.length) data['adFingerprints'] = JSON.stringify(adFingerprints);
+
   return JSON.stringify({
     name: 'LibreTV-Settings',
     time: Date.now().toString(),
@@ -262,6 +304,19 @@ export async function importConfig(content: string): Promise<void> {
         timestamp: typeof item.timestamp === 'number' ? item.timestamp : Date.now(),
       });
     }
+  }
+
+  if (typeof data['adMarks'] === 'string') {
+    try {
+      const marks = JSON.parse(data['adMarks']) as AdMarkEntry[];
+      if (Array.isArray(marks) && marks.length) await db.adMarks.bulkPut(marks);
+    } catch { /* 损坏条目忽略 */ }
+  }
+  if (typeof data['adFingerprints'] === 'string') {
+    try {
+      const fps = JSON.parse(data['adFingerprints']) as AdFingerprintEntry[];
+      if (Array.isArray(fps) && fps.length) await db.adFingerprints.bulkPut(fps);
+    } catch { /* 损坏条目忽略 */ }
   }
 }
 

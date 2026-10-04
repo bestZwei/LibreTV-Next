@@ -7,6 +7,12 @@ import Hls, { type HlsConfig } from 'hls.js';
 import { PlaybackRecovery, describeHlsError } from '@/lib/playback-recovery';
 import { createHlsLoader } from '@/lib/hls-loader';
 import {
+  findGroupAt, mergeRanges, isAdjacentRange,
+  addAdMark, learnMarkFingerprints, removeAdMark, type FragLike,
+} from '@/lib/ad-marks';
+import { ensureFingerprintsLoaded } from '@/lib/ad-fingerprints';
+import { useToast } from './toast';
+import {
   getVideoPrefetcher,
   getNextEpisodePrefetcher,
 } from '@/lib/video-prefetcher';
@@ -93,11 +99,100 @@ export function PlayerShell({
   const recoveryRef = useRef<PlaybackRecovery | null>(null);
   // 自然播完标记，卸载时不回写进度（避免覆盖「已看完」记录）
   const endedRef = useRef(false);
+  // —— 用户标记广告（第 4 层） ——
+  // 当前集的跳过区间（用户标记 + 指纹命中合并），rAF 守卫据此 seek 越过
+  const adRangesRef = useRef<{ start: number; end: number }[]>([]);
+  // 最近一次标记（10s 内再次点击 = 扩展到相邻分组）
+  const lastMarkRef = useRef<{ range: { start: number; end: number }; markId: string; at: number } | null>(null);
+  const { toast: showToast } = useToast();
 
   const showHint = (text: string) => {
     setHint(text);
     if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
     hintTimerRef.current = setTimeout(() => setHint(''), 2500);
+  };
+
+  /**
+   * 标记当前分组为广告（第 4 层：用户主动标记）。
+   * 定位：hls.js 运行时结构（latestLevelDetails.fragments 按连续相同 cc 分组），
+   * 广告在源站拼接时独立成组，组边界即广告边界——用户只需在广告播放时点一下。
+   * 降级：源无 DISCONTINUITY（整集一组）时只标记当前分片。
+   * 生效：当集立即加入跳过区间并 seek 到组尾；组内分片指纹入库（user 级），
+   * 之后任何一集命中即自动跳过所在分组。
+   */
+  const markCurrentAd = () => {
+    const hls = hlsRef.current;
+    const art = artRef.current;
+    if (!hls || !art) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const details = (hls as any).latestLevelDetails;
+    const frags = (details?.fragments || []) as FragLike[];
+    if (!frags.length) {
+      showHint('分片信息未就绪，稍后再试');
+      return;
+    }
+    const t = art.currentTime;
+    const group = findGroupAt(frags, t);
+    let target: { start: number; end: number; frags: FragLike[]; whole: boolean };
+    if (group) {
+      target = { start: group.start, end: group.end, frags: group.frags, whole: true };
+    } else {
+      // 降级：整集一组（无 DISCONTINUITY），只标当前分片
+      const frag = frags.find((f) => t >= f.start && t < f.start + f.duration);
+      if (!frag) {
+        showHint('未定位到当前分段');
+        return;
+      }
+      target = { start: frag.start, end: frag.start + frag.duration, frags: [frag], whole: false };
+    }
+
+    // 10s 内再次点击且与上次标记相邻 → 视为扩展（各自入库，跳过区间合并）
+    const last = lastMarkRef.current;
+    const extending = !!(last && Date.now() - last.at < 10_000 && isAdjacentRange(last.range, target));
+
+    // 当集立即生效
+    adRangesRef.current = mergeRanges([...adRangesRef.current, { start: target.start, end: target.end }]);
+    if (t >= target.start && t < target.end) art.currentTime = target.end;
+
+    const epKey = propsRef.current.episodeKey || currentMediaUrlRef.current;
+    const epIndex = Number(epKey.split(':').pop());
+    const episodeLabel = Number.isFinite(epIndex) ? `第 ${epIndex + 1} 集` : '';
+    const scope = target.whole ? '当前分段' : '当前分片（该源无分段边界）';
+
+    void (async () => {
+      try {
+        const mark = await addAdMark({
+          title: propsRef.current.title,
+          episodeKey: epKey,
+          episodeLabel,
+          start: target.start,
+          end: target.end,
+          segCount: target.frags.length,
+          fingerprintCount: 0,
+        });
+        lastMarkRef.current = { range: { start: target.start, end: target.end }, markId: mark.id, at: Date.now() };
+        const learned = await learnMarkFingerprints(mark.id, target.frags);
+        showToast(
+          `已标记广告 ${formatTime(target.start)}–${formatTime(target.end)}（${scope}${extending ? '，已扩展' : ''}），` +
+            `本片源今后自动跳过${learned ? `，已学习 ${learned} 个分片指纹` : ''}`,
+          'success',
+          {
+            action: {
+              label: '撤销',
+              onClick: () => {
+                void removeAdMark(mark.id);
+                adRangesRef.current = adRangesRef.current.filter(
+                  (r) => !(Math.abs(r.start - target.start) < 0.5 && Math.abs(r.end - target.end) < 0.5)
+                );
+                if (lastMarkRef.current?.markId === mark.id) lastMarkRef.current = null;
+              },
+            },
+          }
+        );
+      } catch {
+        showHint('标记保存失败，请重试');
+      }
+    })();
   };
 
   // 片段缓存开启时调大 hls.js 自身缓冲，缓冲之外的空窗由预取器补齐
@@ -156,6 +251,8 @@ export function PlayerShell({
   const setupHls = (video: HTMLVideoElement, mediaUrl: string, allowProxyFallback: boolean) => {
     hlsRef.current?.destroy();
     currentMediaUrlRef.current = mediaUrl;
+    // 跳过区间按媒体时间轴计，换源（换集/重试/代理回退）后作废
+    adRangesRef.current = [];
     const hls = new Hls(buildHlsConfig());
     hlsRef.current = hls;
 
@@ -294,6 +391,17 @@ export function PlayerShell({
       theme: '#2563eb',
       lang: navigator.language.toLowerCase().startsWith('zh') ? 'zh-cn' : 'en',
       moreVideoAttr: { crossOrigin: 'anonymous', playsInline: true },
+      // 用户标记广告（第 4 层）：控制条按钮，普通态与全屏均可见
+      controls: [
+        {
+          name: 'mark-ad',
+          position: 'right',
+          index: 10,
+          html: '标记广告',
+          tooltip: '标记当前分段为广告，今后自动跳过',
+          click: () => markCurrentAd(),
+        },
+      ],
       customType: {
         m3u8: (video: HTMLVideoElement, mediaUrl: string) => {
           setupHls(video, mediaUrl, true);
@@ -301,6 +409,48 @@ export function PlayerShell({
       },
     });
     artRef.current = art;
+
+    // 指纹库加载（用户标记学到的分片指纹，loader 命中检测用）
+    void ensureFingerprintsLoaded();
+
+    // 指纹命中（loader 广播单分片区间）→ 扩展为所在分组并入跳过列表。
+    // findGroupAt 按时间定位（命中分片的 start 落在自身区间内），分组与
+    // hls.js 时间轴零偏差；无 DISCONTINUITY 源返回 null 时用原始分片区间。
+    const onAdFragment = (e: Event) => {
+      const detail = (e as CustomEvent<{ start: number; end: number }>).detail;
+      if (!detail || !(detail.end > detail.start)) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const details = (hlsRef.current as any)?.latestLevelDetails;
+      const frags = (details?.fragments || []) as FragLike[];
+      const group = findGroupAt(frags, detail.start);
+      const range = group ? { start: group.start, end: group.end } : detail;
+      adRangesRef.current = mergeRanges([...adRangesRef.current, range]);
+    };
+    window.addEventListener('libretv:ad-fragment', onAdFragment);
+
+    // 兜底跳过守卫（双通道）：rAF 在页面可见时逐帧检查（反应 ≤1 帧）；
+    // video:timeupdate 在后台标签页仍以 ~250ms 触发，兜底 rAF 停转的场景。
+    // 两者共用同一区间列表与判定：播放位置进入广告区间即 seek 到区间末尾。
+    const skipAdAt = () => {
+      const ranges = adRangesRef.current;
+      if (!ranges.length) return;
+      const cur = artRef.current;
+      const t = cur?.currentTime;
+      if (typeof t !== 'number' || cur?.paused) return;
+      for (const r of ranges) {
+        if (t >= r.start && t < r.end - 0.25) {
+          cur.currentTime = r.end;
+          return;
+        }
+      }
+    };
+    const adGuard = () => {
+      skipAdAt();
+      requestAnimationFrame(adGuard);
+    };
+    requestAnimationFrame(adGuard);
+    art.on('video:timeupdate', () => skipAdAt());
+
     art.on('video:loadedmetadata', () => {
       // ArtPlayer 运行时支持 title 选项（类型定义未覆盖），用于界面标题展示
       try {
@@ -455,6 +605,7 @@ export function PlayerShell({
       }
       document.removeEventListener('keydown', shortcuts);
       document.removeEventListener('visibilitychange', saveOnHide);
+      window.removeEventListener('libretv:ad-fragment', onAdFragment);
       if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
       el?.removeEventListener('touchstart', onTouchStart);
       el?.removeEventListener('touchend', onTouchEnd);

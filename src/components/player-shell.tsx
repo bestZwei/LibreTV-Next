@@ -582,7 +582,10 @@ export function PlayerShell({
 
     // —— 键盘快捷键（旧版 hotkey:false + 自定义逻辑的移植） ——
     const shortcuts = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement;
+      const target = e.target as HTMLElement | null;
+      // e.target 可能是 document 等非元素对象（程序化派发事件/无聚焦元素），
+      // 其上没有 closest，直接短路放行
+      if (!target || typeof target.closest !== 'function') return;
       // 输入框或按钮获得焦点时不劫持按键：否则空格会吞掉按钮的默认激活
       if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.closest('button')) return;
       const current = artRef.current;

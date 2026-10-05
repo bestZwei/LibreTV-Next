@@ -8,7 +8,8 @@ import { PlaybackRecovery, describeHlsError } from '@/lib/playback-recovery';
 import { createHlsLoader } from '@/lib/hls-loader';
 import {
   findGroupAt, mergeRanges, isAdjacentRange,
-  addAdMark, getMarksForEpisode, learnMarkFingerprints, removeAdMark, type FragLike,
+  addAdMark, getMarksForEpisode, getAdMark, learnMarkFingerprints, removeAdMark,
+  type FragLike, type FilteredEntry,
 } from '@/lib/ad-marks';
 import { ensureFingerprintsLoaded } from '@/lib/ad-fingerprints';
 import { registerStripForPlaylist, unregisterStripForPlaylist, fragUrlsOf } from '@/lib/ad-strip';
@@ -47,6 +48,8 @@ interface PlayerShellProps {
   onPause?: (position: number, duration: number) => void;
   /** 恢复策略判源不可用（重试耗尽/格式硬失败）时回调：父级弹出换源面板 */
   onRequestSwitchSource?: (reason: string) => void;
+  /** 本集已过滤条目变化（播放器下方列表的数据源） */
+  onFilteredEntries?: (entries: FilteredEntry[]) => void;
 }
 
 export function PlayerShell({
@@ -62,6 +65,7 @@ export function PlayerShell({
   onEnded,
   onPause,
   onRequestSwitchSource,
+  onFilteredEntries,
 }: PlayerShellProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -77,10 +81,12 @@ export function PlayerShell({
   const propsRef = useRef({
     url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey,
     getRestorePosition, onTimeUpdate, onEnded, onPause, onRequestSwitchSource,
+    onFilteredEntries,
   });
   propsRef.current = {
     url, title, adFilter, autoplayNext, episodeKey, nextUrl, nextEpisodeKey,
     getRestorePosition, onTimeUpdate, onEnded, onPause, onRequestSwitchSource,
+    onFilteredEntries,
   };
 
   // 跨集共享、每次换集重置的播放链路状态
@@ -101,12 +107,22 @@ export function PlayerShell({
   // 自然播完标记，卸载时不回写进度（避免覆盖「已看完」记录）
   const endedRef = useRef(false);
   // —— 用户标记广告（第 4 层） ——
-  // 当前集的跳过区间（用户标记 + 指纹命中合并），守卫据此 seek 越过
+  // 当前集的跳过区间（由条目列表派生：非剔除条目的合并），守卫据此 seek 越过
   const adRangesRef = useRef<{ start: number; end: number }[]>([]);
+  // 本集已过滤条目（UI 列表数据 + 跳过区间的来源）；变更经
+  // onFilteredEntries 上报父级渲染，播放器自身不依赖其渲染输出
+  const adEntriesRef = useRef<FilteredEntry[]>([]);
+  const applyEntries = (next: FilteredEntry[]) => {
+    // 按 id 去重（标记入库与集数加载可能竞态产生同 id 条目），按起点排序
+    const uniq = [...new Map(next.map((e) => [e.id, e])).values()].sort((a, b) => a.start - b.start);
+    adEntriesRef.current = uniq;
+    adRangesRef.current = mergeRanges(uniq.filter((e) => !e.removed).map((e) => ({ start: e.start, end: e.end })));
+    propsRef.current.onFilteredEntries?.(uniq);
+  };
   // 最近一次标记（10s 内再次点击 = 扩展到相邻分组）
   const lastMarkRef = useRef<{ range: { start: number; end: number }; markId: string; at: number } | null>(null);
-  // 上一帧播放位置（跳过守卫的「自然越过」判定；手动 seek 落入区间不弹）
-  const lastPosRef = useRef<number | null>(null);
+  // 用户 seek 落入的广告区间起点（守卫放行回看意图；离开后恢复自动跳过）
+  const insideBySeekRef = useRef<number | null>(null);
   // 重建链路后的恢复位置（标记时间轴剔除/撤销时校正进度）
   const pendingResumeRef = useRef<number | null>(null);
   const { toast: showToast } = useToast();
@@ -155,28 +171,15 @@ export function PlayerShell({
     const last = lastMarkRef.current;
     const extending = !!(last && Date.now() - last.at < 10_000 && isAdjacentRange(last.range, target));
 
-    // 当集立即生效（若随后重建链路会被清空，改为时间轴剔除生效）
-    adRangesRef.current = mergeRanges([...adRangesRef.current, { start: target.start, end: target.end }]);
-    if (t >= target.start && t < target.end) art.currentTime = target.end;
-
     const epKey = propsRef.current.episodeKey || currentMediaUrlRef.current;
     const epIndex = Number(epKey.split(':').pop());
     const episodeLabel = Number.isFinite(epIndex) ? `第 ${epIndex + 1} 集` : '';
     const scope = target.whole ? '当前分段' : '当前分片（该源无分段边界）';
 
-    // —— 时间轴剔除：注册分片文件名并重建播放链路，广告从进度条上消失 ——
-    // 有分组边界（可整组移除）时执行；降级形态（单分片）仍走跳过式。
-    let resumeAt: number | null = null;
-    if (target.whole) {
-      const mediaUrl = currentMediaUrlRef.current;
-      registerStripForPlaylist(mediaUrl, fragUrlsOf(target.frags));
-      // 位置校正：旧时间轴上位于广告之后的播放位置，新时间轴前移一个广告时长
-      resumeAt = t >= target.end ? t - (target.end - target.start) : Math.max(t, 0);
-      pendingResumeRef.current = resumeAt;
-      setupHls(art.video, mediaUrl, true);
-      // 剔除后时间轴收短，区间坐标已作废
-      adRangesRef.current = [];
-      lastMarkRef.current = null;
+    // —— 时间轴剔除：入库后注册分片文件名并重建播放链路（广告从进度条上
+    // 消失）；降级形态（单分片）立即跳过本分片。
+    if (!target.whole && t >= target.start && t < target.end) {
+      art.currentTime = target.end;
     }
 
     void (async () => {
@@ -189,32 +192,42 @@ export function PlayerShell({
           end: target.end,
           segCount: target.frags.length,
           urls: fragUrlsOf(target.frags),
+          wholeGroup: target.whole ? 1 : 0,
           fingerprintCount: 0,
         });
-        if (!target.whole) lastMarkRef.current = { range: { start: target.start, end: target.end }, markId: mark.id, at: Date.now() };
+        applyEntries([
+          ...adEntriesRef.current.filter((x) => x.markId !== mark.id),
+          { id: mark.id, start: target.start, end: target.end, origin: 'mark', removed: target.whole, segCount: target.frags.length, markId: mark.id },
+        ]);
+        if (target.whole) {
+          // 入库完成后再注册剔除并重建：此时集数标记读取必然包含新标记，
+          // 重建后时间轴上该分组已被移除，播放从剔除点（原区间起点）继续
+          registerStripForPlaylist(currentMediaUrlRef.current, fragUrlsOf(target.frags));
+          pendingResumeRef.current = t >= target.end ? t - (target.end - target.start) : t <= target.start ? t : target.start;
+          setupHls(art.video, currentMediaUrlRef.current, true);
+        } else {
+          lastMarkRef.current = { range: { start: target.start, end: target.end }, markId: mark.id, at: Date.now() };
+        }
         const learned = await learnMarkFingerprints(mark.id, target.frags);
         showToast(
           `已标记广告 ${formatTime(target.start)}–${formatTime(target.end)}（${scope}${extending ? '，已扩展' : ''}），` +
-            (target.whole
-              ? `已从播放进度条中移除${resumeAt !== null ? '，从原位置继续播放' : ''}`
-              : '本片源今后自动跳过') +
+            (target.whole ? '已从播放进度条中移除' : '本片源今后自动跳过') +
             (learned ? `，已学习 ${learned} 个分片指纹` : ''),
           'success',
           {
             action: {
               label: '撤销',
               onClick: () => {
-                void removeAdMark(mark.id);
-                adRangesRef.current = adRangesRef.current.filter(
-                  (r) => !(Math.abs(r.start - target.start) < 0.5 && Math.abs(r.end - target.end) < 0.5)
-                );
-                if (lastMarkRef.current?.markId === mark.id) lastMarkRef.current = null;
-                // 撤销时间轴剔除：重新拉取未剔除的播放列表并回到原位置
-                if (target.whole) {
-                  unregisterStripForPlaylist(currentMediaUrlRef.current, fragUrlsOf(target.frags));
-                  pendingResumeRef.current = target.start; // 剔除区间在新时间轴的起点
-                  setupHls(art.video, currentMediaUrlRef.current, true);
-                }
+                void (async () => {
+                  if (target.whole) {
+                    unregisterStripForPlaylist(currentMediaUrlRef.current, fragUrlsOf(target.frags));
+                    pendingResumeRef.current = target.start;
+                    setupHls(artRef.current?.video, currentMediaUrlRef.current, true);
+                  }
+                  await removeAdMark(mark.id);
+                  applyEntries(adEntriesRef.current.filter((x) => x.markId !== mark.id));
+                  if (lastMarkRef.current?.markId === mark.id) lastMarkRef.current = null;
+                })();
               },
             },
           }
@@ -281,25 +294,41 @@ export function PlayerShell({
   const setupHls = (video: HTMLVideoElement, mediaUrl: string, allowProxyFallback: boolean) => {
     hlsRef.current?.destroy();
     currentMediaUrlRef.current = mediaUrl;
-    // 跳过区间按媒体时间轴计，换源（换集/重试/代理回退）后作废
-    adRangesRef.current = [];
-    lastPosRef.current = null;
+    // 跳过区间/条目按媒体时间轴计，换源（换集/重试/代理回退）后作废；
+    // 本集的持久化标记在下方异步读取后恢复为条目
+    applyEntries([]);
     const hls = new Hls(buildHlsConfig());
     hlsRef.current = hls;
 
     hls.attachMedia(video);
 
-    // 先注册该集已标记分组的剔除指令（Dexie 读取，毫秒级），再拉取播放
-    // 列表——保证标记的分组在首次交付时就被移除；注册失败降级为指纹跳过
+    // 先注册该集已标记分组的剔除指令（Dexie 读取，毫秒级）并恢复条目列表，
+    // 再拉取播放列表——保证标记的分组在首次交付时就被移除；注册失败降级
+    // 为指纹跳过。指纹命中条目（origin=fingerprint）保留合并。
     void (async () => {
+      const kept = adEntriesRef.current.filter((e) => e.origin === 'fingerprint');
       try {
         const epKey = propsRef.current.episodeKey;
         if (epKey) {
           const marks = await getMarksForEpisode(epKey);
-          const urls = marks.flatMap((m) => m.urls || []);
-          if (urls.length) registerStripForPlaylist(mediaUrl, urls);
+          const wholeUrls = marks.filter((m) => m.wholeGroup).flatMap((m) => m.urls || []);
+          if (wholeUrls.length) registerStripForPlaylist(mediaUrl, wholeUrls);
+          const markEntries: FilteredEntry[] = marks.map((m) => ({
+            id: m.id,
+            start: m.start,
+            end: m.end,
+            origin: 'mark',
+            removed: !!m.wholeGroup,
+            segCount: m.segCount,
+            markId: m.id,
+          }));
+          applyEntries([...kept, ...markEntries]);
+        } else {
+          applyEntries(kept);
         }
-      } catch { /* 注册失败不影响播放 */ }
+      } catch {
+        applyEntries(kept); // 注册失败降级为指纹跳过
+      }
       hls.loadSource(mediaUrl);
     })();
 
@@ -480,31 +509,81 @@ export function PlayerShell({
       const frags = (details?.fragments || []) as FragLike[];
       const group = findGroupAt(frags, detail.start);
       const range = group ? { start: group.start, end: group.end } : detail;
-      adRangesRef.current = mergeRanges([...adRangesRef.current, range]);
+      // 去重：已有条目覆盖该范围（同组多分片重复命中）则跳过
+      if (adEntriesRef.current.some((x) => x.start <= range.start + 0.5 && x.end >= range.end - 0.5)) return;
+      applyEntries([
+        ...adEntriesRef.current,
+        {
+          id: `fp_${range.start.toFixed(1)}`,
+          start: range.start,
+          end: range.end,
+          origin: 'fingerprint',
+          removed: false,
+          segCount: group?.frags.length || 1,
+        },
+      ]);
+      // 晚到命中补偿：分片加载+哈希是异步的，区间加入时播放可能刚越过起点
+      // （几秒内且非主动 seek）→ 补跳到组尾；越过多或刚 seek 过则视为回看
+      const cur = artRef.current;
+      const now = cur?.currentTime;
+      // 晚到命中补偿：分片加载+哈希异步，区间入列时播放可能刚越过起点——
+      // 非「seek 落入」且未越过多（<3s）则补跳到组尾
+      if (!cur?.paused && typeof now === 'number' &&
+          now >= range.start && now < range.end - 0.25 &&
+          now - range.start < 3 && insideBySeekRef.current !== range.start) {
+        cur.currentTime = range.end;
+      }
     };
     window.addEventListener('libretv:ad-fragment', onAdFragment);
 
+    // 「本集已过滤条目」列表的交互（watch 页渲染，事件回传播放器）：
+    // 跳到条目起点；撤销标记（整组剔除的撤销会拉回原播放列表并回原位置）
+    const onSeekTo = (e: Event) => {
+      const time = (e as CustomEvent<{ time: number }>).detail?.time;
+      if (typeof time === 'number' && artRef.current) artRef.current.currentTime = time;
+    };
+    const onUndoMark = (e: Event) => {
+      const markId = (e as CustomEvent<{ markId: string }>).detail?.markId;
+      if (!markId) return;
+      const entry = adEntriesRef.current.find((x) => x.markId === markId);
+      void (async () => {
+        const mark = await getAdMark(markId);
+        await removeAdMark(markId);
+        if (entry?.removed && mark?.urls?.length) {
+          unregisterStripForPlaylist(currentMediaUrlRef.current, mark.urls);
+          pendingResumeRef.current = entry.start; // 回到被剔除区间的起点
+          const art = artRef.current;
+          if (art) setupHls(art.video, currentMediaUrlRef.current, true);
+        }
+        applyEntries(adEntriesRef.current.filter((x) => x.markId !== markId));
+      })();
+    };
+    window.addEventListener('libretv:seek-to', onSeekTo);
+    window.addEventListener('libretv:undo-mark', onUndoMark);
+
     // 兜底跳过守卫（双通道）：rAF 在页面可见时逐帧检查（反应 ≤1 帧）；
     // video:timeupdate 在后台标签页仍以 ~250ms 触发，兜底 rAF 停转的场景。
-    // 跳过仅在「播放自然越过区间起点」时触发——手动 seek 落入区间视为
-    // 用户主动回看，不弹回（否则 ← 回退会被守卫卡死）。
+    // 语义：播放位置处于广告区间内且不是「用户 seek 落入」→ seek 到区间
+    // 末尾。seek 落入视为回看意图不弹（否则 ← 回退会被守卫卡死）；
+    // 离开该区间后恢复自动跳过。
     const skipAdAt = () => {
       const cur = artRef.current;
       const t = cur?.currentTime;
-      if (typeof t !== 'number' || cur?.paused) return;
+      if (typeof t !== 'number') return;
       const ranges = adRangesRef.current;
-      const prev = lastPosRef.current;
+      const flagged = insideBySeekRef.current;
+      if (flagged !== null) {
+        const fr = ranges.find((r) => r.start === flagged);
+        if (!fr || t < fr.start || t >= fr.end - 0.25) insideBySeekRef.current = null; // 已离开，恢复自动跳过
+      }
+      if (cur.paused) return;
       for (const r of ranges) {
         if (t >= r.start && t < r.end - 0.25) {
-          // prev 为 null（刚起播/换源）视为自然越过；上一位置已在区间内或
-          // 区间之后 → 说明是 seek 进来的，放行
-          if (prev !== null && prev >= r.start - 0.25) return;
+          if (insideBySeekRef.current === r.start) return; // 用户 seek 落入，回看意图
           cur.currentTime = r.end;
-          lastPosRef.current = r.end;
           return;
         }
       }
-      lastPosRef.current = t;
     };
     const adGuard = () => {
       skipAdAt();
@@ -513,8 +592,11 @@ export function PlayerShell({
     requestAnimationFrame(adGuard);
     art.on('video:timeupdate', () => skipAdAt());
     art.on('video:seeked', () => {
-      // seek 后以落点为基准重置「上一位置」：落在区间内 = 用户意图，不弹
-      lastPosRef.current = artRef.current?.currentTime ?? null;
+      // seek 落点在广告区间内 → 标记「seek 落入」，守卫放行（回看意图）
+      const t = artRef.current?.currentTime;
+      if (typeof t !== 'number') return;
+      const r = adRangesRef.current.find((r) => t >= r.start && t < r.end);
+      insideBySeekRef.current = r ? r.start : null;
     });
 
     art.on('video:loadedmetadata', () => {
@@ -675,6 +757,8 @@ export function PlayerShell({
       document.removeEventListener('keydown', shortcuts);
       document.removeEventListener('visibilitychange', saveOnHide);
       window.removeEventListener('libretv:ad-fragment', onAdFragment);
+      window.removeEventListener('libretv:seek-to', onSeekTo);
+      window.removeEventListener('libretv:undo-mark', onUndoMark);
       if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
       el?.removeEventListener('touchstart', onTouchStart);
       el?.removeEventListener('touchend', onTouchEnd);

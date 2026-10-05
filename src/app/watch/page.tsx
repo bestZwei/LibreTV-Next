@@ -16,6 +16,8 @@ const PlayerShell = dynamic(() => import('@/components/player-shell').then((m) =
   ),
 });
 import { EmptyState, LoadingState, Spinner } from '@/components/states';
+import { AdFilteredList } from '@/components/ad-filtered-list';
+import type { FilteredEntry } from '@/lib/ad-marks';
 import { SwitchSourceModal } from '@/components/switch-source';
 import { enqueueDownload } from '@/components/download-manager';
 import { Icon } from '@/components/icon';
@@ -58,6 +60,8 @@ function WatchContent() {
 
   const [reversed, setReversed] = useState(false);
   const [switchOpen, setSwitchOpen] = useState(false);
+  // 本集已过滤条目（用户标记 + 指纹命中），由 PlayerShell 上报
+  const [filteredEntries, setFilteredEntries] = useState<FilteredEntry[]>([]);
 
   const source = resolveSource(store, sourceKey, {
     url: searchParams.get('sourceUrl') || undefined,
@@ -248,6 +252,7 @@ function WatchContent() {
                   onTimeUpdate={handleProgress}
                   onPause={handleProgress}
                   onEnded={handleEnded}
+                  onFilteredEntries={setFilteredEntries}
                 />
               ) : (
                 <div className="w-full h-full flex items-center justify-center">
@@ -261,6 +266,9 @@ function WatchContent() {
                 </div>
               )}
             </div>
+
+            {/* 本集已过滤条目（用户标记/指纹命中） */}
+            <AdFilteredList entries={filteredEntries} />
 
             {/* 操作栏 */}
             <div className="flex flex-wrap items-center gap-2 mt-3">

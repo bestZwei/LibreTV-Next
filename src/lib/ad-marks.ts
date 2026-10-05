@@ -25,6 +25,20 @@ export interface FragLike {
   url: string;
 }
 
+/** 本集已过滤条目（播放器下方列表的 UI 数据） */
+export interface FilteredEntry {
+  id: string;
+  start: number;
+  end: number;
+  /** mark = 用户标记；fingerprint = 指纹命中（他人标记学习/自己的跨集命中） */
+  origin: 'mark' | 'fingerprint';
+  /** true = 该分组已从时间轴剔除（进度条上不存在），不可跳过区间 */
+  removed: boolean;
+  segCount: number;
+  /** origin=mark 时的标记记录 id（撤销用） */
+  markId?: string;
+}
+
 export interface FragGroup {
   /** 组内分片（同一连续 cc 段） */
   frags: FragLike[];
@@ -112,6 +126,15 @@ export async function getMarksForEpisode(episodeKey: string): Promise<AdMarkEntr
     return await db.adMarks.where('episodeKey').equals(episodeKey).toArray();
   } catch {
     return [];
+  }
+}
+
+/** 读取单条标记（撤销时间轴剔除时取其分片地址） */
+export async function getAdMark(markId: string): Promise<AdMarkEntry | undefined> {
+  try {
+    return await db.adMarks.get(markId);
+  } catch {
+    return undefined;
   }
 }
 

@@ -52,15 +52,14 @@ export function AdFilteredList({ entries }: { entries: FilteredEntry[] }) {
               <button
                 type="button"
                 className="block text-content hover:text-primary transition-colors text-left"
-                title={e.removed ? '该分段已从进度条移除，跳到移除点' : '跳到此处'}
+                title="跳到此处"
                 onClick={() => window.dispatchEvent(new CustomEvent('libretv:seek-to', { detail: { time: e.start } }))}
               >
                 {i + 1}. {fmt(e.start)}–{fmt(e.end)}
               </button>
               <div className="text-faint">
                 {e.origin === 'mark' ? '我的标记' : '指纹命中'}
-                {e.removed ? ' · 已从进度条移除' : ''}
-                {` · ${e.segCount} 个分片`}
+                  {` · ${e.segCount} 个分片`}
               </div>
             </div>
             {e.origin === 'mark' && e.markId && (

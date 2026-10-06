@@ -8,11 +8,10 @@ import { PlaybackRecovery, describeHlsError } from '@/lib/playback-recovery';
 import { createHlsLoader } from '@/lib/hls-loader';
 import {
   findGroupAt, mergeRanges, isAdjacentRange,
-  addAdMark, getMarksForEpisode, getAdMark, learnMarkFingerprints, removeAdMark,
+  addAdMark, getMarksForEpisode, learnMarkFingerprints, removeAdMark,
   type FragLike, type FilteredEntry,
 } from '@/lib/ad-marks';
 import { ensureFingerprintsLoaded } from '@/lib/ad-fingerprints';
-import { registerStripForPlaylist, unregisterStripForPlaylist, fragUrlsOf } from '@/lib/ad-strip';
 import { generateThumb, setThumbHlsCtor } from '@/lib/ad-thumb';
 import { db } from '@/lib/db';
 import { useToast } from './toast';
@@ -118,7 +117,7 @@ export function PlayerShell({
     // 按 id 去重（标记入库与集数加载可能竞态产生同 id 条目），按起点排序
     const uniq = [...new Map(next.map((e) => [e.id, e])).values()].sort((a, b) => a.start - b.start);
     adEntriesRef.current = uniq;
-    adRangesRef.current = mergeRanges(uniq.filter((e) => !e.removed).map((e) => ({ start: e.start, end: e.end })));
+    adRangesRef.current = mergeRanges(uniq.map((e) => ({ start: e.start, end: e.end })));
     updateProgressMarks();
     propsRef.current.onFilteredEntries?.(uniq);
   };
@@ -132,7 +131,7 @@ export function PlayerShell({
     if (!progress) return;
     let wrap = progress.querySelector('.ltv-ad-marks') as HTMLElement | null;
     const duration = art.duration || 0;
-    const active = adEntriesRef.current.filter((e) => !e.removed);
+    const active = adEntriesRef.current;
     if (!duration || !active.length) {
       wrap?.remove();
       return;
@@ -158,9 +157,8 @@ export function PlayerShell({
   // 最近一次标记（10s 内再次点击 = 扩展到相邻分组）
   const lastMarkRef = useRef<{ range: { start: number; end: number }; markId: string; at: number } | null>(null);
   // 用户 seek 落入的广告区间起点（守卫放行回看意图；离开后恢复自动跳过）
-  const insideBySeekRef = useRef<number | null>(null);
-  // 重建链路后的恢复位置（标记时间轴剔除/撤销时校正进度）
-  const pendingResumeRef = useRef<number | null>(null);
+  // 列表跳入并选择观看的广告区间起点（旁路自动跳过，离开区间后恢复）
+  const bypassedRef = useRef<number | null>(null);
   const { toast: showToast } = useToast();
 
   const showHint = (text: string) => {
@@ -212,9 +210,9 @@ export function PlayerShell({
     const episodeLabel = Number.isFinite(epIndex) ? `第 ${epIndex + 1} 集` : '';
     const scope = target.whole ? '当前分段' : '当前分片（该源无分段边界）';
 
-    // —— 时间轴剔除：入库后注册分片文件名并重建播放链路（广告从进度条上
-    // 消失）；降级形态（单分片）立即跳过本分片。
-    if (!target.whole && t >= target.start && t < target.end) {
+    // 统一「标记 + 跳过」语义：不做时间轴剔除（进度条保留广告段并以色块
+    // 标出），标记后落在区间内立即跳到组尾
+    if (t >= target.start && t < target.end) {
       art.currentTime = target.end;
     }
 
@@ -227,25 +225,15 @@ export function PlayerShell({
           start: target.start,
           end: target.end,
           segCount: target.frags.length,
-          urls: fragUrlsOf(target.frags),
-          durs: target.frags.map((f) => f.duration),
-          wholeGroup: target.whole ? 1 : 0,
+          segs: target.frags.map((f) => ({ u: f.url, d: f.duration })),
           fingerprintCount: 0,
         });
         const segs = target.frags.map((f) => ({ u: f.url, d: f.duration }));
         applyEntries([
           ...adEntriesRef.current.filter((x) => x.markId !== mark.id),
-          { id: mark.id, start: target.start, end: target.end, origin: 'mark', removed: target.whole, segCount: target.frags.length, segs, markId: mark.id },
+          { id: mark.id, start: target.start, end: target.end, origin: 'mark', segCount: target.frags.length, segs, markId: mark.id },
         ]);
-        if (target.whole) {
-          // 入库完成后再注册剔除并重建：此时集数标记读取必然包含新标记，
-          // 重建后时间轴上该分组已被移除，播放从剔除点（原区间起点）继续
-          registerStripForPlaylist(currentMediaUrlRef.current, fragUrlsOf(target.frags));
-          pendingResumeRef.current = t >= target.end ? t - (target.end - target.start) : t <= target.start ? t : target.start;
-          setupHls(art.video, currentMediaUrlRef.current, true);
-        } else {
-          lastMarkRef.current = { range: { start: target.start, end: target.end }, markId: mark.id, at: Date.now() };
-        }
+        lastMarkRef.current = { range: { start: target.start, end: target.end }, markId: mark.id, at: Date.now() };
         const learned = await learnMarkFingerprints(mark.id, target.frags);
         // 画面预览缩略图（后台生成，写回标记与条目）
         void generateThumb(segs).then((thumb) => {
@@ -255,7 +243,7 @@ export function PlayerShell({
         });
         showToast(
           `已标记广告 ${formatTime(target.start)}–${formatTime(target.end)}（${scope}${extending ? '，已扩展' : ''}），` +
-            (target.whole ? '已从播放进度条中移除' : '本片源今后自动跳过') +
+            '本片源今后自动跳过' +
             (learned ? `，已学习 ${learned} 个分片指纹` : ''),
           'success',
           {
@@ -263,11 +251,6 @@ export function PlayerShell({
               label: '撤销',
               onClick: () => {
                 void (async () => {
-                  if (target.whole) {
-                    unregisterStripForPlaylist(currentMediaUrlRef.current, fragUrlsOf(target.frags));
-                    pendingResumeRef.current = target.start;
-                    setupHls(artRef.current?.video, currentMediaUrlRef.current, true);
-                  }
                   await removeAdMark(mark.id);
                   applyEntries(adEntriesRef.current.filter((x) => x.markId !== mark.id));
                   if (lastMarkRef.current?.markId === mark.id) lastMarkRef.current = null;
@@ -346,50 +329,45 @@ export function PlayerShell({
 
     hls.attachMedia(video);
 
-    // 先注册该集已标记分组的剔除指令（Dexie 读取，毫秒级）并恢复条目列表，
-    // 再拉取播放列表——保证标记的分组在首次交付时就被移除；注册失败降级
-    // 为指纹跳过。指纹命中条目（origin=fingerprint）保留合并。
+    // 先恢复该集的标记条目（Dexie 读取，毫秒级），再拉取播放列表；指纹命中
+    // 条目（origin=fingerprint）保留合并。为缺缩略图的标记补生成画面预览。
     void (async () => {
       const kept = adEntriesRef.current.filter((e) => e.origin === 'fingerprint');
       try {
         const epKey = propsRef.current.episodeKey;
         if (epKey) {
           const marks = await getMarksForEpisode(epKey);
-          const wholeUrls = marks.filter((m) => m.wholeGroup).flatMap((m) => m.urls || []);
-          if (wholeUrls.length) registerStripForPlaylist(mediaUrl, wholeUrls);
           const markEntries: FilteredEntry[] = marks.map((m) => ({
             id: m.id,
             start: m.start,
             end: m.end,
             origin: 'mark',
-            removed: !!m.wholeGroup,
             segCount: m.segCount,
+            segs: m.segs,
+            thumb: m.thumb,
             markId: m.id,
           }));
           applyEntries([...kept, ...markEntries]);
+          for (const me of markEntries) {
+            if (!me.thumb && me.segs?.length) {
+              void generateThumb(me.segs).then((thumb) => {
+                if (!thumb) return;
+                void db.adMarks.update(me.markId as string, { thumb });
+                applyEntries(adEntriesRef.current.map((x) => (x.id === me.id ? { ...x, thumb } : x)));
+              });
+            }
+          }
         } else {
           applyEntries(kept);
         }
       } catch {
-        applyEntries(kept); // 注册失败降级为指纹跳过
+        applyEntries(kept); // 读取失败保留指纹命中条目
       }
       hls.loadSource(mediaUrl);
     })();
 
     hls.on(Hls.Events.MANIFEST_PARSED, async () => {
       recoveryRef.current?.markHealthy();
-      // 重建链路的恢复位置（标记时间轴剔除/撤销后的进度校正），优先于
-      // 保存进度恢复
-      if (pendingResumeRef.current != null) {
-        const at = pendingResumeRef.current;
-        pendingResumeRef.current = null;
-        restoredRef.current = true;
-        video.currentTime = at;
-        // 预取锚点：恢复目标
-        ensurePrefetch(mediaUrl, at);
-        video.play().catch(() => {});
-        return;
-      }
       // 预取锚点：恢复进度时直接取恢复目标。赋值后 video.currentTime 未必立刻反映
       // （Safari 系），而 ensure 是以「锚点未变」为前提复用 parsing 中的运行的——
       // 这里读到旧值会把窗口建在片头，且白等一次纠错重建。
@@ -564,21 +542,9 @@ export function PlayerShell({
           start: range.start,
           end: range.end,
           origin: 'fingerprint',
-          removed: false,
           segCount: group?.frags.length || 1,
         },
       ]);
-      // 晚到命中补偿：分片加载+哈希是异步的，区间加入时播放可能刚越过起点
-      // （几秒内且非主动 seek）→ 补跳到组尾；越过多或刚 seek 过则视为回看
-      const cur = artRef.current;
-      const now = cur?.currentTime;
-      // 晚到命中补偿：分片加载+哈希异步，区间入列时播放可能刚越过起点——
-      // 非「seek 落入」且未越过多（<3s）则补跳到组尾
-      if (!cur?.paused && typeof now === 'number' &&
-          now >= range.start && now < range.end - 0.25 &&
-          now - range.start < 3 && insideBySeekRef.current !== range.start) {
-        cur.currentTime = range.end;
-      }
     };
     window.addEventListener('libretv:ad-fragment', onAdFragment);
 
@@ -586,21 +552,17 @@ export function PlayerShell({
     // 跳到条目起点；撤销标记（整组剔除的撤销会拉回原播放列表并回原位置）
     const onSeekTo = (e: Event) => {
       const time = (e as CustomEvent<{ time: number }>).detail?.time;
-      if (typeof time === 'number' && artRef.current) artRef.current.currentTime = time;
+      if (typeof time !== 'number' || !artRef.current) return;
+      // 列表跳入 = 回看意图：旁路该区间的自动跳过（离开区间后恢复）
+      const r = adRangesRef.current.find((x) => time > x.start + 0.05 && time < x.end - 0.25);
+      if (r) bypassedRef.current = r.start;
+      artRef.current.currentTime = time;
     };
     const onUndoMark = (e: Event) => {
       const markId = (e as CustomEvent<{ markId: string }>).detail?.markId;
       if (!markId) return;
-      const entry = adEntriesRef.current.find((x) => x.markId === markId);
       void (async () => {
-        const mark = await getAdMark(markId);
         await removeAdMark(markId);
-        if (entry?.removed && mark?.urls?.length) {
-          unregisterStripForPlaylist(currentMediaUrlRef.current, mark.urls);
-          pendingResumeRef.current = entry.start; // 回到被剔除区间的起点
-          const art = artRef.current;
-          if (art) setupHls(art.video, currentMediaUrlRef.current, true);
-        }
         applyEntries(adEntriesRef.current.filter((x) => x.markId !== markId));
       })();
     };
@@ -612,21 +574,23 @@ export function PlayerShell({
     // 语义：播放位置处于广告区间内且不是「用户 seek 落入」→ seek 到区间
     // 末尾。seek 落入视为回看意图不弹（否则 ← 回退会被守卫卡死）；
     // 离开该区间后恢复自动跳过。
+    // 跳过守卫（双通道）：rAF 可见时逐帧 + timeupdate 后台兜底。
+    // 播放位置处于未旁路的广告区间 → seek 到区间末尾（前进越过）。
     const skipAdAt = () => {
       const cur = artRef.current;
       const t = cur?.currentTime;
-      if (typeof t !== 'number') return;
+      if (typeof t !== 'number' || cur?.paused) return;
       const ranges = adRangesRef.current;
-      const flagged = insideBySeekRef.current;
-      if (flagged !== null) {
-        const fr = ranges.find((r) => r.start === flagged);
-        if (!fr || t < fr.start || t >= fr.end - 0.25) insideBySeekRef.current = null; // 已离开，恢复自动跳过
+      const b = bypassedRef.current;
+      if (b !== null) {
+        const br = ranges.find((r) => r.start === b);
+        // 清除：前进越过区间尾，或大幅回退远离（回退跳过落点在起点前 0.1s，
+        // 此处保持旁路——否则落点后播放 0.15s 重新进入区间会被前进守卫弹回）
+        if (!br || t >= br.end - 0.25 || t < br.start - 1) bypassedRef.current = null;
       }
-      if (cur.paused) return;
       for (const r of ranges) {
-        if (t >= r.start && t < r.end - 0.25) {
-          if (insideBySeekRef.current === r.start) return; // 用户 seek 落入，回看意图
-          cur.currentTime = r.end;
+        if (t > r.start + 0.05 && t < r.end - 0.25) {
+          if (bypassedRef.current !== r.start) cur.currentTime = r.end;
           return;
         }
       }
@@ -637,12 +601,13 @@ export function PlayerShell({
     };
     requestAnimationFrame(adGuard);
     art.on('video:timeupdate', () => skipAdAt());
-    art.on('video:seeked', () => {
-      // seek 落点在广告区间内 → 标记「seek 落入」，守卫放行（回看意图）
+    art.on('video:seeking', () => {
+      // seek 落点在广告区间内 → 在 seeking 阶段先行旁路：rAF 守卫在
+      // seeked 事件之前的间隙不会把落点弹到组尾（回看意图不打扰）
       const t = artRef.current?.currentTime;
       if (typeof t !== 'number') return;
-      const r = adRangesRef.current.find((r) => t >= r.start && t < r.end);
-      insideBySeekRef.current = r ? r.start : null;
+      const r = adRangesRef.current.find((x) => t >= x.start && t < x.end);
+      bypassedRef.current = r ? r.start : null;
     });
 
     art.on('video:loadedmetadata', () => {
@@ -687,6 +652,11 @@ export function PlayerShell({
       }
     });
     art.on('video:seeked', () => {
+      // seek 落点在广告区间内 → 旁路该区间的自动跳过（回看意图不打扰，
+      // 离开区间后恢复）；自然播放越过起点仍由守卫自动跳过
+      const t = art.currentTime;
+      const r = adRangesRef.current.find((x) => t >= x.start && t < x.end);
+      bypassedRef.current = r ? r.start : null;
       ensurePrefetch(currentMediaUrlRef.current, art.currentTime);
     });
     art.on('video:pause', () => {

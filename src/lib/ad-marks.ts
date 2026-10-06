@@ -32,8 +32,6 @@ export interface FilteredEntry {
   end: number;
   /** mark = 用户标记；fingerprint = 指纹命中（他人标记学习/自己的跨集命中） */
   origin: 'mark' | 'fingerprint';
-  /** true = 该分组已从时间轴剔除（进度条上不存在），不可跳过区间 */
-  removed: boolean;
   segCount: number;
   /** 组内分片（画面预览缩略图用：url + 时长） */
   segs?: { u: string; d: number }[];

@@ -267,7 +267,7 @@ function WatchContent() {
               )}
             </div>
 
-            {/* 本集已过滤条目（用户标记/指纹命中） */}
+            {/* 本集已过滤条目（用户标记/指纹命中）；无条目时显示空态引导 */}
             <AdFilteredList entries={filteredEntries} />
 
             {/* 操作栏 */}

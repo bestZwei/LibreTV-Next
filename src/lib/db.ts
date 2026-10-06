@@ -87,6 +87,10 @@ export interface AdMarkEntry {
   segCount: number;
   /** 分段内分片的绝对地址（时间轴剔除用：loader 按文件名匹配并整组移除） */
   urls?: string[];
+  /** 与 urls 平行的分片时长（秒，画面预览 mini-m3u8 的 EXTINF 用） */
+  durs?: number[];
+  /** 画面预览缩略图（dataURL，标记后异步生成） */
+  thumb?: string;
   /** 1 = 整组标记（可时间轴剔除）；0/缺省 = 降级单分片标记（仅跳过式） */
   wholeGroup?: number;
   /** 入库指纹数量（学习完成前为 0） */

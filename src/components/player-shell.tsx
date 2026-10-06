@@ -13,6 +13,8 @@ import {
 } from '@/lib/ad-marks';
 import { ensureFingerprintsLoaded } from '@/lib/ad-fingerprints';
 import { registerStripForPlaylist, unregisterStripForPlaylist, fragUrlsOf } from '@/lib/ad-strip';
+import { generateThumb, setThumbHlsCtor } from '@/lib/ad-thumb';
+import { db } from '@/lib/db';
 import { useToast } from './toast';
 import {
   getVideoPrefetcher,
@@ -117,7 +119,41 @@ export function PlayerShell({
     const uniq = [...new Map(next.map((e) => [e.id, e])).values()].sort((a, b) => a.start - b.start);
     adEntriesRef.current = uniq;
     adRangesRef.current = mergeRanges(uniq.filter((e) => !e.removed).map((e) => ({ start: e.start, end: e.end })));
+    updateProgressMarks();
     propsRef.current.onFilteredEntries?.(uniq);
+  };
+
+  // 进度条上的广告区间色块（斜纹红）：活跃（非剔除）条目的可视化
+  const updateProgressMarks = () => {
+    const art = artRef.current;
+    if (!art) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const progress = (art as any).controls?.progress as HTMLElement | undefined;
+    if (!progress) return;
+    let wrap = progress.querySelector('.ltv-ad-marks') as HTMLElement | null;
+    const duration = art.duration || 0;
+    const active = adEntriesRef.current.filter((e) => !e.removed);
+    if (!duration || !active.length) {
+      wrap?.remove();
+      return;
+    }
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.className = 'ltv-ad-marks';
+      wrap.style.cssText = 'position:absolute;inset:0;pointer-events:none;';
+      if (getComputedStyle(progress).position === 'static') progress.style.position = 'relative';
+      progress.appendChild(wrap);
+    }
+    wrap.innerHTML = '';
+    for (const e of active) {
+      const d = document.createElement('div');
+      d.title = `已过滤广告 ${e.start.toFixed(0)}s-${e.end.toFixed(0)}s`;
+      d.style.cssText =
+        `position:absolute;top:0;bottom:0;left:${((e.start / duration) * 100).toFixed(2)}%;` +
+        `width:${(((e.end - e.start) / duration) * 100).toFixed(2)}%;` +
+        'background:repeating-linear-gradient(45deg,rgba(255,72,72,.6) 0 4px,rgba(255,72,72,.22) 4px 8px);';
+      wrap.appendChild(d);
+    }
   };
   // 最近一次标记（10s 内再次点击 = 扩展到相邻分组）
   const lastMarkRef = useRef<{ range: { start: number; end: number }; markId: string; at: number } | null>(null);
@@ -192,12 +228,14 @@ export function PlayerShell({
           end: target.end,
           segCount: target.frags.length,
           urls: fragUrlsOf(target.frags),
+          durs: target.frags.map((f) => f.duration),
           wholeGroup: target.whole ? 1 : 0,
           fingerprintCount: 0,
         });
+        const segs = target.frags.map((f) => ({ u: f.url, d: f.duration }));
         applyEntries([
           ...adEntriesRef.current.filter((x) => x.markId !== mark.id),
-          { id: mark.id, start: target.start, end: target.end, origin: 'mark', removed: target.whole, segCount: target.frags.length, markId: mark.id },
+          { id: mark.id, start: target.start, end: target.end, origin: 'mark', removed: target.whole, segCount: target.frags.length, segs, markId: mark.id },
         ]);
         if (target.whole) {
           // 入库完成后再注册剔除并重建：此时集数标记读取必然包含新标记，
@@ -209,6 +247,12 @@ export function PlayerShell({
           lastMarkRef.current = { range: { start: target.start, end: target.end }, markId: mark.id, at: Date.now() };
         }
         const learned = await learnMarkFingerprints(mark.id, target.frags);
+        // 画面预览缩略图（后台生成，写回标记与条目）
+        void generateThumb(segs).then((thumb) => {
+          if (!thumb) return;
+          void db.adMarks.update(mark.id, { thumb });
+          applyEntries(adEntriesRef.current.map((x) => (x.id === mark.id ? { ...x, thumb } : x)));
+        });
         showToast(
           `已标记广告 ${formatTime(target.start)}–${formatTime(target.end)}（${scope}${extending ? '，已扩展' : ''}），` +
             (target.whole ? '已从播放进度条中移除' : '本片源今后自动跳过') +
@@ -495,8 +539,10 @@ export function PlayerShell({
     });
     artRef.current = art;
 
-    // 指纹库加载（用户标记学到的分片指纹，loader 命中检测用）
+    // 预览缩略图的 hls 构造器注入 + 指纹库加载
+    setThumbHlsCtor(Hls);
     void ensureFingerprintsLoaded();
+    art.on('video:loadedmetadata', () => updateProgressMarks());
 
     // 指纹命中（loader 广播单分片区间）→ 扩展为所在分组并入跳过列表。
     // findGroupAt 按时间定位（命中分片的 start 落在自身区间内），分组与

@@ -35,6 +35,10 @@ export interface FilteredEntry {
   /** true = 该分组已从时间轴剔除（进度条上不存在），不可跳过区间 */
   removed: boolean;
   segCount: number;
+  /** 组内分片（画面预览缩略图用：url + 时长） */
+  segs?: { u: string; d: number }[];
+  /** 画面预览缩略图（dataURL，异步生成后回填） */
+  thumb?: string;
   /** origin=mark 时的标记记录 id（撤销用） */
   markId?: string;
 }
